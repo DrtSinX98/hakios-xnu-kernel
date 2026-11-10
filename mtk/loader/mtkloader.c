@@ -34,10 +34,12 @@
 #define XNU_PHYS_BASE       0xc0000000ULL
 #define XNU_MEM_SIZE        0x7fffc000ULL
 #define DRAM_END_GB         5
+#define SOC_IS_MT6781       1
 #else
 #define XNU_PHYS_BASE       0xc0000000ULL
 #define XNU_MEM_SIZE        0xfe000000ULL       /* up to dramc-rk1 at 0x1bffff000; room for the system image */
 #define DRAM_END_GB         8
+#define SOC_IS_MT6781       0
 #endif
 /* Where the system image is put, clear of the kernel, as xnuloader does it (RESIDENT_RD_OFFSET). */
 #define SYSTEM_PA           (XNU_PHYS_BASE + 0x08000000ULL)
@@ -155,7 +157,11 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
  * wired from the start, and three and a half minutes of every boot (run 320).
  */
 #ifndef XNU_ROOT_EMMC
+#if SOC_IS_MT6781
+#define XNU_ROOT_EMMC       0       /* no eMMC (UFS, not in yet): the root is the payload's RAM disk */
+#else
 #define XNU_ROOT_EMMC       1
+#endif
 #endif
 #if XNU_ROOT_EMMC
 #define XNU_ROOT_ARG        "rd=md0 emmc_root=1"     /* (rd=md0 for libignition's "ramdisk" boot) */
@@ -1517,6 +1523,23 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 	dbg_puts("=== end of XNU log ===\n");
 	save_host_keep(&xsyms);
 	show_log_tail(40);
+	if (SOC_IS_MT6781) {
+		/*
+		 * No reset: no DRAM survives one on the MT6781 (MARKER_TEST), so Android starts in this boot,
+		 * over the log just put in ramoops. XNU's loader_return left the other cores off (cpus=1), its
+		 * shared interrupts disabled, and the stub the MMU and caches off. What XNU quiets only with
+		 * bootcpu= is done here: its timer, and core 0's redistributor and CPU interface.
+		 */
+		const uint64_t sgi = 0x0c040000ULL + 0x10000;    /* core 0's SGI/PPI frame */
+
+		__asm__ volatile("msr cntv_ctl_el0, xzr; isb");
+		wr32(sgi + 0x180, 0xffffffffu);   /* GICR_ICENABLER0 */
+		wr32(sgi + 0x280, 0xffffffffu);   /* GICR_ICPENDR0 */
+		wr32(sgi + 0x380, 0xffffffffu);   /* GICR_ICACTIVER0 */
+		__asm__ volatile("msr S3_0_C12_C12_7, xzr; isb");    /* ICC_IGRPEN1_EL1 */
+		dbg_delay_ms(5000);
+		chain_android();
+	}
 	dbg_delay_ms(20000);
 	reset_board();
 }
@@ -2311,7 +2334,7 @@ static void __attribute__((noreturn)) run_xnu(void)
 		memcpy((void *)rd_pa, pi.ramdisk, pi.ramdisk_size);
 	}
 	/* and the big one off the flash, if it is there (with XNU_ROOT_EMMC the kernel reads it itself) */
-	uint64_t sys_size = XNU_ROOT_EMMC ? 0 : load_system_image();
+	uint64_t sys_size = XNU_ROOT_EMMC || SOC_IS_MT6781 ? 0 : load_system_image();   /* MT6781: MSDC0 is the Hot 20's */
 	uint64_t sys_pa = sys_size ? SYSTEM_PA : 0;
 	uint64_t sys_span = (sys_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
 
@@ -2434,8 +2457,10 @@ static void __attribute__((noreturn)) run_xnu(void)
 	 * place to do it from: it would have to carry those hundred kilobytes itself, and it comes
 	 * up long after the chip has forgotten them.
 	 */
-	touch_bring_up();
-	big_cores_clock();
+	if (!SOC_IS_MT6781) {     /* the Hot 20's touch controller (SPI2) and big cores' PLL */
+		touch_bring_up();
+		big_cores_clock();
+	}
 	/*
 	 * Nothing of ours is left on the panel: iOS paints only what it draws, and where it does not
 	 * reach, what LK wrote there stays -- its "Orange State: your device has been unlocked"
@@ -3053,9 +3078,36 @@ static int pmsg_take(const char *flag, uint32_t n)
 	return found;
 }
 
+#if SOC_IS_MT6781
+/*
+ * On the MT6781 Android's pmsg flag does not always get here: LK can put ramoops back from expdb over it.
+ * So volume down, held while this asks, is a request too: keypad key 1, bit 1 of KP_MEM1, clear while the
+ * key is down (KEY_PROBE). Three samples in a row, so that a bounce does not count.
+ */
+static int volume_down_held(void)
+{
+	uint32_t run = 0;
+
+	out("hold volume down now for Darwin/XNU (3 s)\n");
+	for (uint32_t t = 0; t < 30; t++) {
+		run = (rd32(0x10010004ULL) & (1u << 1)) ? 0 : run + 1;
+		if (run == 3) {
+			return 1;
+		}
+		dbg_delay_ms(100);
+	}
+	return 0;
+}
+#endif
+
 static int xnu_requested(void)
 {
-	return pmsg_take(boot_xnu_flag, sizeof(boot_xnu_flag) - 1);
+	int asked = pmsg_take(boot_xnu_flag, sizeof(boot_xnu_flag) - 1);
+
+#if SOC_IS_MT6781
+	asked = asked || volume_down_held();
+#endif
+	return asked;
 }
 
 static int boot_choice(void)
@@ -3658,7 +3710,8 @@ void mtkloader_main(uint64_t dtb)
 	fbc.x = 0;
 	fbc.y = fbc.top = 0;
 	fbc.fg = 0xff40ff40u;
-	out("== mtkloader: Darwin/XNU on X6826B (MT6768) ==\n");
+	out(SOC_IS_MT6781 ? "== mtkloader: Darwin/XNU on realme 8i (MT6781) ==\n" :
+	    "== mtkloader: Darwin/XNU on X6826B (MT6768) ==\n");
 	fbc.fg = 0xffffffffu;
 	out("LK dtb ");
 	out_hex(dtb);
