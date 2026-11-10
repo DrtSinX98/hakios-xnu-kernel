@@ -54,6 +54,7 @@ void hakios_mtk_emmc_devfs(void);      /* /dev/emmc0, /dev/remmc0: the MT6768's 
 int hakios_mtk_emmc_root(dev_t *root); /* emmc_root=1: that partition as the root; 0 or an errno */
 void hakios_mt6781_ufs_init(void);     /* mtkufs=1: the realme 8i's UFS partition xnusys, read only, /dev/mtkufs0 */
 int hakios_mtk_ufs_root(dev_t *root);  /* mtkufs_root=1: that partition as the root; 0 or an errno */
+void hakios_mt6781_wdt_init(void);     /* mtk_wdt_kick=1: the MT6781's watchdog kicked every 5 s during the run */
 /* a line kept and said again every minute, so that it reaches the end of a run's log (hakios.mali.c; else only said) */
 void hakios_keep(const char *format, ...) __printflike(1, 2);
 void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */

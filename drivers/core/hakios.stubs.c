@@ -91,6 +91,10 @@ void hakios_mtk_emmc_devfs(void) {}
 int hakios_mtk_emmc_root(__unused dev_t *root) { return ENXIO; }      /* IOFindBSDRoot then says emmc_root=1 cannot be */
 #endif
 
+#ifndef HAKIOS_MT6781_WDT
+void hakios_mt6781_wdt_init(void) {}
+#endif
+
 #ifndef HAKIOS_MT6781_UFS
 void hakios_mt6781_ufs_init(void) {}
 int hakios_mtk_ufs_root(__unused dev_t *root) { return ENXIO; }      /* IOFindBSDRoot then says mtkufs_root=1 cannot be */

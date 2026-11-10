@@ -1,0 +1,9 @@
+# mtk/mt6781/drivers/core/conf: the MT6781's watchdog.
+# CONFIG_HAKIOS_<NAME>=y in a defconfig builds a driver into the kernel (docs/drivers-config.md). MediaTek's drivers are
+# `default n`: a configuration has them only when it includes mt6781.config.
+
+driver MT6781_WDT
+	file    bsd/dev/hakios.mt6781_wdt.c
+	default n
+	help    mtk_wdt_kick=1: the TOPRGU watchdog mtkloader arms (31 s) restarted every 5 s, so a run can be longer; a kernel that
+	help    stops scheduling still ends in its reset. Only the restart key is written
