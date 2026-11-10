@@ -1854,18 +1854,19 @@ index 2b14eda8f68f..09337bad5b01 100644
 +#endif
      ")";
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 5219fb0d9ed6..ab4e83089940 100644
+index 5219fb0d9ed6..0180effed93d 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -64,6 +64,7 @@ extern dev_t mdevadd(int devid, uint64_t base, unsigned int size, int phys);
+@@ -64,6 +64,8 @@ extern dev_t mdevadd(int devid, uint64_t base, unsigned int size, int phys);
  extern dev_t mdevlookup(int devid);
  extern void mdevremoveall(void);
  extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
 +extern int hakios_mtk_emmc_root(dev_t *root);        /* mtk/mt6768/drivers/storage/hakios.mtk_emmc.c; ENXIO when not built */
++extern int hakios_mtk_ufs_root(dev_t *root);         /* mtk/mt6781/drivers/storage/hakios.mt6781_ufs.c; ENXIO when not built */
  extern void di_root_ramfile(IORegistryEntry * entry);
  extern int IODTGetDefault(const char *key, void *infoAddr, unsigned int infoSize);
  extern boolean_t cpuid_vmm_present(void);
-@@ -683,7 +684,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -683,7 +685,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	assert(matching);
  	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
  
@@ -1881,7 +1882,7 @@ index 5219fb0d9ed6..ab4e83089940 100644
  		OSSafeReleaseNULL(service);
  	} else {
  		IOLog("!BSD\n");
-@@ -762,10 +770,39 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -762,10 +771,51 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  #endif /* __LP64__ */
  				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
  			}
@@ -1907,12 +1908,24 @@ index 5219fb0d9ed6..ab4e83089940 100644
 +//	emmc_root=1 beside rd=md0, which stays for user space to see -- libignition takes the "ramdisk" boot from it
 +//
 +	uint32_t emmcRoot = 0;
++	uint32_t mtkufsRoot = 0;
 +	if (PE_parse_boot_argn("emmc_root", &emmcRoot, sizeof(emmcRoot)) && emmcRoot) {
 +		OSSafeReleaseNULL(matching);
 +		if (hakios_mtk_emmc_root(root) != 0) {
 +			panic("IOFindBSDRoot: emmc_root=1, but the eMMC's xnusys partition could not be read (or CONFIG_HAKIOS_MTK_EMMC is not set)");
 +		}
 +		strlcpy(rootName, "emmc0", rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++//	The same on the MT6781's UFS (mtk/mt6781/drivers/storage/hakios.mt6781_ufs.c): boot-arg mtkufs_root=1, with mtkufs=1
++	if (PE_parse_boot_argn("mtkufs_root", &mtkufsRoot, sizeof(mtkufsRoot)) && mtkufsRoot) {
++		OSSafeReleaseNULL(matching);
++		if (hakios_mtk_ufs_root(root) != 0) {
++			panic("IOFindBSDRoot: mtkufs_root=1, but the UFS's xnusys partition could not be read (or mtkufs=1, XNU_UFS=1 or CONFIG_HAKIOS_MT6781_UFS is missing)");
++		}
++		strlcpy(rootName, "mtkufs0", rootNameSize);
 +		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
 +		*oflags = 0;
 +		goto iofrootx;

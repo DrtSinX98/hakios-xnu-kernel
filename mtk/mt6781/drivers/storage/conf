@@ -1,0 +1,9 @@
+# mtk/mt6781/drivers/storage/conf: the MT6781's storage.
+# CONFIG_HAKIOS_<NAME>=y in a defconfig builds a driver into the kernel (docs/drivers-config.md). MediaTek's drivers are
+# `default n`: a configuration has them only when it includes mt6781.config.
+
+driver MT6781_UFS
+	file    bsd/dev/hakios.mt6781_ufs.c
+	default n
+	help    the realme 8i's UFS (ufshci@11270000), read only, polled: the partition xnusys of LUN 2 as /dev/mtkufs0, and with
+	help    mtkufs_root=1 the root. mtkufs=1, and mtkloader built with XNU_UFS=1 (it gives the extent and LK's list)

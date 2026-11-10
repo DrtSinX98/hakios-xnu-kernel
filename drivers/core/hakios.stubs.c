@@ -31,6 +31,7 @@ void hakios_mpss_stop(void);
 void hakios_mpss_quiesce(void);
 void hakios_ddr_quiesce(void);
 void hakios_ufs_quiesce(void);
+void hakios_mt6781_ufs_quiesce(void);
 void hakios_var_save_on_return(void);
 void hakios_mic_quiesce(void);
 void HakiosWLANStart(const char *interface, const uint8_t *address);
@@ -88,6 +89,12 @@ void hakios_mtk_connsys_init(void) {}
 #ifndef HAKIOS_MTK_EMMC
 void hakios_mtk_emmc_devfs(void) {}
 int hakios_mtk_emmc_root(__unused dev_t *root) { return ENXIO; }      /* IOFindBSDRoot then says emmc_root=1 cannot be */
+#endif
+
+#ifndef HAKIOS_MT6781_UFS
+void hakios_mt6781_ufs_init(void) {}
+int hakios_mtk_ufs_root(__unused dev_t *root) { return ENXIO; }      /* IOFindBSDRoot then says mtkufs_root=1 cannot be */
+void hakios_mt6781_ufs_quiesce(void) {}
 #endif
 
 #ifndef HAKIOS_UFS

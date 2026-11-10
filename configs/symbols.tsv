@@ -195,6 +195,7 @@ MODEM_STEP	arg	modem_step	Cellular	k	hakios.mpss.c	the steps once the root is th
 MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c	
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
 MTK_CPUFREQ	arg	mtk_cpufreq	Touch and buttons	k	hakios.mtk_keys.c	
+MTKUFS_ROOT	arg	mtkufs_root	CPU, memory and boot	k	(patch)	
 PMIC_LIST	arg	pmic_list	Chip, thermal and PMIC	k	hakios.pmic.c	only the clock, not the inventory of every block
 PRIVS	arg	privs	Security stand-ins	k	kern_minimac.c	
 RD	arg	rd	CPU, memory and boot	kl	(patch),loader.c	

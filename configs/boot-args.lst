@@ -213,6 +213,7 @@ modem_step	k
 modem_wait	k
 modem_wda_off	k
 mtk_cpufreq	k
+mtkufs_root	k
 net_names	k
 net_trace	k
 pmic	k
