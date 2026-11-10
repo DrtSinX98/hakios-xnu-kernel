@@ -102,6 +102,10 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef CAM_PROBE
 #define CAM_PROBE           0
 #endif
+/* 1: read the keypad and the volume keys' GPIO word for 8 s and report what changes (hold the keys); then on as usual. */
+#ifndef KEY_PROBE
+#define KEY_PROBE           0
+#endif
 /* 1: read the eMMC and report, then go back to Android (no XNU). */
 #ifndef MSDC_TEST
 #define MSDC_TEST           0
@@ -3527,6 +3531,48 @@ static void marker_test(void)
 static const char cam_probe_flag[] = "DARWIN-REDWOOD:CAM-PROBE";
 #endif /* CAM_PROBE */
 
+#if KEY_PROBE
+/*
+ * Read only. The keypad keeps a bit per key in KP_MEM1..5, clear while the key is down (the spaced device tree
+ * maps volume down to its key 1; volume up is the PMIC's "reset key"); the device tree also names GPIO 80 and 81
+ * for the volume keys, read here as the input word of pins 64..95 (its offset is a guess from the MT6768).
+ */
+static void key_probe(void)
+{
+	uint32_t last[6], now[6];
+
+	for (int i = 0; i < 6; i++) {
+		last[i] = 0xdeadbeefu;
+	}
+	out("key probe: 8 s -- hold volume down, let go, hold volume up\n");
+	for (uint32_t t = 0; t < 80; t++) {
+		int changed = 0;
+
+		for (int i = 0; i < 5; i++) {
+			now[i] = rd32(0x10010004ULL + 4 * i) & 0xffffu;    /* KP_MEM1..5 */
+		}
+		now[5] = rd32(0x10005220ULL);                             /* GPIO DIN, pins 64..95 */
+		for (int i = 0; i < 6; i++) {
+			changed |= now[i] != last[i];
+			last[i] = now[i];
+		}
+		if (changed) {
+			out("key probe: ");
+			out_dec(t * 100);
+			out(" ms KP_MEM");
+			for (int i = 0; i < 5; i++) {
+				out(" ");
+				out_hex(now[i]);
+			}
+			out(" GPIO64-95 ");
+			out_hex(now[5]);
+			out("\n");
+		}
+		dbg_delay_ms(100);
+	}
+}
+#endif
+
 void mtkloader_main(uint64_t dtb)
 {
 #if PASS_THROUGH
@@ -3561,6 +3607,9 @@ void mtkloader_main(uint64_t dtb)
 	}
 
 	plog_reset();
+#if KEY_PROBE
+	key_probe();
+#endif
 #if TOUCH_PROBE
 	fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
 	fbc.x = 0;
