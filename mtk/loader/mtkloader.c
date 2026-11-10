@@ -113,6 +113,11 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef UFS_PROBE
 #define UFS_PROBE           0
 #endif
+/* 1 (with UFS_PROBE): after the probe, one SCSI READ(10) of LBA 1 of LUN 2 (the user unit's GPT header) through LK's
+ * transfer list, slot 0, polled; the result checked and reported. A read: nothing on the flash changes. */
+#ifndef UFS_READ_TEST
+#define UFS_READ_TEST       0
+#endif
 /* 1: read the eMMC and report, then go back to Android (no XNU). */
 #ifndef MSDC_TEST
 #define MSDC_TEST           0
@@ -3680,6 +3685,122 @@ static void ufs_probe(void)
 		out("\n");
 	}
 }
+
+#if UFS_READ_TEST
+/*
+ * One 4 KiB read, the UFSHCI way (JESD223; Linux's ufshcd lays it out the same): a UTP transfer request descriptor
+ * in slot 0 of LK's list, pointing at a command descriptor here -- the COMMAND UPIU at 0, the RESPONSE UPIU at
+ * 512, one PRDT entry at 1024, offsets in dwords -- with the CDB READ(10) of LBA 1, one block, LUN 2 (the user unit,
+ * 15620096 blocks of 4096 bytes). The MMU is off, so the controller and this code see the same memory. Nothing of the
+ * controller's setup is changed: only the descriptor, doorbell bit 0 and, after, the completion bit in IS.
+ */
+static uint8_t ufs_ucd[1024 + 16] __attribute__((aligned(128)));
+static uint8_t ufs_data[4096] __attribute__((aligned(4096)));
+
+static int ufs_read_test(void)
+{
+	const uint64_t utrl = rd32(UFSHCI_BASE + 0x50) | (uint64_t)rd32(UFSHCI_BASE + 0x54) << 32;
+	volatile uint32_t *utrd = (volatile uint32_t *)utrl;
+	volatile uint8_t *cmd = ufs_ucd, *rsp = ufs_ucd + 512;
+	volatile uint32_t *prdt = (volatile uint32_t *)(ufs_ucd + 1024);
+	const uint32_t lba = 1;
+	uint32_t t;
+
+	if ((rd32(UFSHCI_BASE + 0x30) & 0xf) != 0xf || rd32(UFSHCI_BASE + 0x58) != 0 || rd32(UFSHCI_BASE + 0x60) != 1 ||
+	    utrl < 0x40000000ULL || utrl >= 0x140000000ULL) {
+		out("ufs read: the controller is not as the probe saw it; nothing sent\n");
+		return 0;
+	}
+	for (uint32_t i = 0; i < sizeof(ufs_ucd); i++) {
+		ufs_ucd[i] = 0;
+	}
+	for (uint32_t i = 0; i < sizeof(ufs_data); i++) {
+		ufs_data[i] = 0xa5;
+	}
+	/* COMMAND UPIU: type 0x01, flags R, LUN 2, task tag 0; expected length 4096 (big-endian); CDB READ(10) */
+	cmd[0] = 0x01;
+	cmd[1] = 0x40;
+	cmd[2] = 2;
+	cmd[3] = 0;
+	cmd[12] = 0x00;
+	cmd[13] = 0x00;
+	cmd[14] = 0x10;
+	cmd[15] = 0x00;
+	cmd[16] = 0x28;
+	cmd[18] = (uint8_t)(lba >> 24);
+	cmd[19] = (uint8_t)(lba >> 16);
+	cmd[20] = (uint8_t)(lba >> 8);
+	cmd[21] = (uint8_t)lba;
+	cmd[24] = 1;                    /* one block */
+	/* PRDT: the data buffer, byte count - 1 */
+	prdt[0] = (uint32_t)(uint64_t)ufs_data;
+	prdt[1] = (uint32_t)((uint64_t)ufs_data >> 32);
+	prdt[2] = 0;
+	prdt[3] = sizeof(ufs_data) - 1;
+	/* UTRD, slot 0: UFS storage command, device to host, no interrupt; OCS 0xf until the controller writes it */
+	utrd[0] = (1u << 28) | 0x04000000u;
+	utrd[1] = 0;
+	utrd[2] = 0xf;
+	utrd[3] = 0;
+	utrd[4] = (uint32_t)(uint64_t)ufs_ucd;
+	utrd[5] = (uint32_t)((uint64_t)ufs_ucd >> 32);
+	/* DW6: response UPIU length (15:0) and offset (31:16); DW7: PRDT length (15:0) and offset (31:16), in dwords.
+	 * (The other way round, the first run's "256 entries at offset 1" got OCS 0x1, invalid command table.) */
+	utrd[6] = (128u << 16) | 128u;    /* response UPIU at 512, 512 bytes long */
+	utrd[7] = (256u << 16) | 1u;      /* PRDT at 1024, one entry */
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(UFSHCI_BASE + 0x58, 1);      /* doorbell, slot 0 */
+	for (t = 0; t < 1000 && (rd32(UFSHCI_BASE + 0x58) & 1); t++) {
+		dbg_delay_ms(1);
+	}
+	__asm__ volatile("dsb sy" ::: "memory");    /* what the controller wrote, read from memory */
+	if (rd32(UFSHCI_BASE + 0x58) & 1) {
+		/* still out: clear the slot and stop the list, so that nothing is written into this memory later */
+		wr32(UFSHCI_BASE + 0x5c, ~1u);   /* UTRLCLR: 0 in bit 0 clears slot 0 */
+		wr32(UFSHCI_BASE + 0x60, 0);     /* UTRLRSR: stop */
+		dbg_delay_ms(10);
+		out("ufs read: NO COMPLETION in 1 s; slot cleared and list stopped (UTRLDBR ");
+		out_hex(rd32(UFSHCI_BASE + 0x58));
+		out(", UTRLRSR ");
+		out_hex(rd32(UFSHCI_BASE + 0x60));
+		out(", OCS ");
+		out_hex(utrd[2] & 0xff);
+		out(")\n");
+		return 1;
+	}
+	out("ufs read: ");
+	out((rd32(UFSHCI_BASE + 0x58) & 1) ? "NO COMPLETION in 1 s" : "completed");
+	out(" after ");
+	out_dec(t);
+	out(" ms, OCS ");
+	out_hex(utrd[2] & 0xff);
+	out(", IS ");
+	out_hex(rd32(UFSHCI_BASE + 0x20));
+	out(", response UPIU type ");
+	out_hex(rsp[0]);
+	out(" response ");
+	out_hex(rsp[6]);
+	out(" SCSI status ");
+	out_hex(rsp[7]);
+	out("\n");
+	wr32(UFSHCI_BASE + 0x20, 1);      /* UTRCS, write 1 to clear */
+	volatile uint8_t *data = ufs_data;
+
+	out("ufs read: LBA 1 starts \"");
+	for (uint32_t i = 0; i < 8; i++) {
+		char c[2] = { (data[i] >= 0x20 && data[i] < 0x7f) ? (char)data[i] : '.', 0 };
+		out(c);
+	}
+	uint64_t alt = 0;
+	for (int i = 7; i >= 0; i--) {
+		alt = alt << 8 | data[32 + i];
+	}
+	out("\", backup header at LBA ");
+	out_dec(alt);
+	out(alt == 15620095 ? " (as the GPT says)\n" : " (NOT 15620095)\n");
+	return 0;
+}
+#endif
 #endif
 
 void mtkloader_main(uint64_t dtb)
@@ -3720,6 +3841,13 @@ void mtkloader_main(uint64_t dtb)
 	if (volume_down_held("the UFS probe")) {
 		out("== mtkloader: UFS controller probe ==\n");
 		ufs_probe();
+#if UFS_READ_TEST
+		if (ufs_read_test()) {
+			dbg_delay_ms(15000);        /* on screen, to be photographed */
+			reset_board();              /* not Android: a transfer may have been under way */
+		}
+		dbg_delay_ms(11000);
+#endif
 		dbg_delay_ms(4000);
 	}
 	chain_android();
