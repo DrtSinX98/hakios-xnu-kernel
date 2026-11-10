@@ -98,6 +98,11 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef TIMER_PROBE
 #define TIMER_PROBE         0
 #endif
+/* 1: start Android at once, through UART and ramoops only: a new phone's first chain, before its
+ * watchdog, display and marker addresses are known (no XNU). */
+#ifndef PASS_THROUGH
+#define PASS_THROUGH        0
+#endif
 #ifndef MENU_DEFAULT_XNU
 #define MENU_DEFAULT_XNU    0
 #endif
@@ -3388,6 +3393,14 @@ rails_off:
 
 void mtkloader_main(uint64_t dtb)
 {
+#if PASS_THROUGH
+	lk_dtb = dtb;
+	plog_reset();
+	out("mtkloader: pass-through, LK dtb ");
+	out_hex(dtb);
+	out("\n");
+	chain_android();
+#endif
 	uint32_t mark = marker_get();
 
 	wdt_disable();

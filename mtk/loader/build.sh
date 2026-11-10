@@ -17,11 +17,14 @@ CFLAGS="--target=aarch64-linux-gnu -ffreestanding -nostdlib -fno-builtin -mgener
 # Two headers are made here and never kept in git (.gitignore):
 #  touchfw.h   the touch controller's firmware, out of YOUR phone's hdl_firmware.img (pull-firmware.sh puts it
 #              in fw-touch/): it is the vendor's, and the controller loses it at every reset, so the loader
-#              carries it (tcm.h)
+#              carries it (tcm.h). TOUCH_IMG=none: an empty one, for a loader that never sends it
+#              (-DPASS_THROUGH=1); the next build without it makes the real one again
 #  font8x16.h  the loader's 8x16 text font, rasterized on a Mac by tools/mkfont8x16.swift (from a system font,
 #              which is why the bitmap is not in the repository either)
 TOUCH_IMG="${TOUCH_IMG:-$ROOT/fw-touch/hdl_firmware.img}"
-if [ ! -f "$HERE/touchfw.h" ]; then
+if [ "$TOUCH_IMG" = none ]; then
+	printf '#ifndef TOUCHFW_H\n#define TOUCHFW_H\n#include <stdint.h>\n#define TOUCH_FW_SIZE 0u\n#define TOUCH_FW_FLAG 0u\nstatic const uint8_t touch_fw[1];\n#endif\n' > "$HERE/touchfw.h"
+elif [ ! -f "$HERE/touchfw.h" ] || grep -q "TOUCH_FW_SIZE 0u" "$HERE/touchfw.h"; then
 	[ -f "$TOUCH_IMG" ] || { echo "mtkloader: no $TOUCH_IMG -- run pull-firmware.sh first" >&2; exit 1; }
 	python3 "$HERE/../tools/mktouchfw.py" "$TOUCH_IMG" ROMBOOT_APP_CODE "$HERE/touchfw.h"
 fi
