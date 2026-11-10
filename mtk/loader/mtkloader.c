@@ -4020,7 +4020,11 @@ void mtkloader_main(uint64_t dtb)
 #if ILI_PROBE && SOC_IS_MT6781
 	if (volume_down_held("the touch probe")) {
 		out("== mtkloader: ILI7807S touch probe ==\n");
-		ili_probe();
+		if (ili_probe() && ILI_DOWNLOAD) {
+#if ILI_DOWNLOAD
+			ili_download();
+#endif
+		}
 		out("ili: probe done\n");
 		dbg_delay_ms(15000);        /* on screen, to be photographed */
 	}

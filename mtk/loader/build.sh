@@ -31,6 +31,12 @@ elif [ ! -f "$HERE/touchfw.h" ] || grep -q "TOUCH_FW_SIZE 0u" "$HERE/touchfw.h";
 	[ -f "$TOUCH_IMG" ] || { echo "mtkloader: no $TOUCH_IMG -- run pull-firmware.sh first" >&2; exit 1; }
 	python3 "$HERE/../tools/mktouchfw.py" "$TOUCH_IMG" ROMBOOT_APP_CODE "$HERE/touchfw.h"
 fi
+#  ilifw.h     MT6781: the ILI7807S's touch firmware, out of YOUR phone's fw-touch/FW_NF_ILI7807S_*.bin
+#              (tools/mkilifw.py), for -DILI_DOWNLOAD=1 (mtkili.h); likewise the vendor's, never committed
+ILI_FW="${ILI_FW:-$(ls "$ROOT"/fw-touch/FW_NF_ILI7807S_*.bin 2>/dev/null | head -1)}"
+if [ "$SOC" = MT6781 ] && [ ! -f "$HERE/ilifw.h" ] && [ -f "$ILI_FW" ]; then
+	python3 "$HERE/../tools/mkilifw.py" "$ILI_FW" "$HERE/ilifw.h"
+fi
 [ -f "$HERE/font8x16.h" ] || swift "$HERE/../tools/mkfont8x16.swift" > "$HERE/font8x16.h"
 
 clang $CFLAGS "$@" -c "$HERE/start.S" -o "$HERE/start.o"

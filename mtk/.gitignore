@@ -3,6 +3,7 @@
 loader/*.o
 loader/*.bin
 loader/touchfw.h
+loader/ilifw.h
 loader/font8x16.h
 loader/camjn1.h
 loader/camrx.h
