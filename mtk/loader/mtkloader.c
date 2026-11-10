@@ -108,6 +108,12 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef SOC_PROBE
 #define SOC_PROBE           0
 #endif
+/* 1 (with PASS_THROUGH): once, when Android asks (printf DARWIN-REDWOOD:MARKER-TEST > /dev/pmsg0; reboot), put a
+ * pattern in the marker and reset the board; the next boot says if it survived. How: 1 the watchdog as run_xnu
+ * arms it, 2 PSCI SYSTEM_RESET, 3 the watchdog with DDR reserve on (MT6781: TOPRGU MODE bit 7). */
+#ifndef MARKER_TEST
+#define MARKER_TEST         0
+#endif
 #ifndef MENU_DEFAULT_XNU
 #define MENU_DEFAULT_XNU    0
 #endif
@@ -3446,6 +3452,63 @@ static void soc_probe(void)
 }
 #endif
 
+#if MARKER_TEST
+#define MARK_TEST           0x5354584eu /* "NXTS" */
+#define MARK_TEST_HOW       (MARKER_TEST == 2 ? "PSCI SYSTEM_RESET" : MARKER_TEST == 3 ? \
+                             "the watchdog, DDR reserve on" : "the watchdog")
+/* TOPRGU MODE (vendor mtk_wdt/dbgtop): EN bit 0, EXRST_EN bit 2 (PMIC reset), IRQ_EN bit 3, DUAL_EN bit 6, and
+ * on MT6781, where the device tree has no dbgtop, DDR_RESERVE bit 7 */
+#define MARK_TEST_MODE      (MARKER_TEST == 3 ? 0x81u : 0x1u)
+static const char marker_test_flag[] = "DARWIN-REDWOOD:MARKER-TEST";
+
+static void marker_test(void)
+{
+	/* the marker, the end of ramoops' pmsg zone, and free DRAM across XNU's range */
+	static const uint64_t map[] = { MARKER_PA, 0x4d0e8000ULL, 0xc0000000ULL, 0x100000000ULL, 0x13f000000ULL };
+	int kept = 0;
+
+	for (uint32_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+		uint32_t v = rd32(map[i]);
+
+		out("marker test: ");
+		out_hex(map[i]);
+		out(v == MARK_TEST ? " kept " : " holds ");
+		out_hex(v);
+		out("\n");
+		if (v == MARK_TEST) {
+			kept = 1;
+			wr32(map[i], 0);
+		}
+	}
+	if (kept) {
+		out("marker test: the pattern came through ");
+		out(MARK_TEST_HOW);
+		out("\n");
+		return;
+	}
+	if (!pmsg_take(marker_test_flag, sizeof(marker_test_flag) - 1)) {
+		return;
+	}
+	for (uint32_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+		wr32(map[i], MARK_TEST);
+	}
+	out("marker test: pattern written, reset by ");
+	out(MARK_TEST_HOW);
+	out("\n");
+	if (MARKER_TEST == 2) {
+		psci_system_reset();   /* not reset_board(): its watchdog fallback would hide a PSCI that returns */
+		out("marker test: PSCI SYSTEM_RESET returned\n");
+		return;
+	}
+	wr32(TOPRGU_LENGTH, ((1u * 32768u / 512u) << 5) | 0x8u);
+	wr32(TOPRGU_RESTART, TOPRGU_RESTART_KEY);
+	wr32(TOPRGU_MODE, TOPRGU_MODE_KEY | MARK_TEST_MODE);
+	dbg_delay_ms(5000);
+	wr32(TOPRGU_MODE, TOPRGU_MODE_KEY);
+	out("marker test: the watchdog did not fire\n");
+}
+#endif
+
 void mtkloader_main(uint64_t dtb)
 {
 #if PASS_THROUGH
@@ -3456,6 +3519,9 @@ void mtkloader_main(uint64_t dtb)
 	out("\n");
 #if SOC_PROBE
 	soc_probe();
+#endif
+#if MARKER_TEST
+	marker_test();
 #endif
 	chain_android();
 #endif
