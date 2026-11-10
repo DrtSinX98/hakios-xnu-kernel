@@ -316,6 +316,47 @@ loader_jump(uint64_t reason, uint64_t code)
 #endif /* ARM_PGSHIFT == 12 */
 }
 
+/*
+ * Boot-arg loader_park=PA (mtkloader XNU_PARK): a core leaving the run goes into the loader's pen at PA instead of
+ * being switched off through PSCI -- on the MT6781 a core switched off cannot be switched on again, and the system
+ * that starts after this one (Linux) would hang trying. The pen's 2 MB are mapped one to one, as loader_jump() maps
+ * the return stub, and the pen turns the MMU off itself. Returns only when there is no pen.
+ */
+void
+loader_park(void)
+{
+#if ARM_PGSHIFT == 12
+	uint64_t pen = 0, tcr = __builtin_arm_rsr64("TCR_EL1"), t0sz = tcr & 0x3f;
+
+	if (!PE_parse_boot_argn("loader_park", &pen, sizeof(pen)) || pen == 0 || t0sz < 25 || t0sz > 33 ||
+	    (pen >> (64 - t0sz)) != 0) {
+		return;
+	}
+	loader_l1[pen >> 30] = static_kvtophys(loader_l2) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
+	loader_l2[(pen >> 21) & 0x1ff] = (pen & ~0x1fffffULL) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_AP(AP_RWNA) |
+	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITEBACK);
+	__asm__ volatile ("dsb sy");
+
+	register uint64_t r_ttbr0 __asm__("x0") = static_kvtophys(loader_l1);
+	register uint64_t r_tcr __asm__("x4") = tcr;
+	register uint64_t r_pen __asm__("x5") = pen;
+
+	__asm__ volatile (
+                "msr DAIFSet, #0xf\n"
+                "bic x4, x4, #0x80\n"           /* TCR_EL1.EPD0: allow TTBR0 walks */
+                "msr TCR_EL1, x4\n"
+                "msr TTBR0_EL1, x0\n"
+                "isb\n"
+                "tlbi vmalle1\n"
+                "dsb sy\n"
+                "isb\n"
+                "br x5\n"
+                : : "r" (r_ttbr0), "r" (r_tcr), "r" (r_pen));
+	__builtin_unreachable();
+#endif
+}
+
 extern char *debug_buf_base, *debug_buf_ptr;
 
 /* bsd/sys/msgbuf.h (not includable from osfmk) */

@@ -12,6 +12,9 @@
 .global psci_cpu_on
 .global watcher_entry
 .global cpu_off_entry
+.global xnu_park_pen
+.global xnu_park_pen_end
+.global xnu_park_flags
 .global mmu_on
 .global dcache_clean_range
 .global irq_wait
@@ -207,6 +210,41 @@ psci_cpu_on:
     ldr     x0, =0xc4000003
     smc     #0
     ret
+
+/*
+ * XNU's other cores at the end of a run (XNU_PARK, boot-arg loader_park=), instead of PSCI CPU_OFF: on this phone a core
+ * switched off cannot be switched on again, and Linux would hang trying. mtkloader copies this block to where Linux does
+ * not write (PARK_PA) and XNU jumps into the copy with the MMU still on (an identity map of it). Here: MMU and caches
+ * off, the caches cleaned and invalidated (mtkloader's dcache_clean_all, still in place while XNU runs), "PARK" into
+ * this core's slot (by MPIDR Aff1), and wait. Linux then finds these cores "already on" and does without them.
+ */
+xnu_park_pen:
+    msr     daifset, #0xf
+    mrs     x9, sctlr_el1
+    bic     x9, x9, #0x1
+    bic     x9, x9, #0x4
+    bic     x9, x9, #0x1000
+    msr     sctlr_el1, x9
+    isb
+    ic      iallu
+    tlbi    vmalle1
+    dsb     sy
+    isb
+    ldr     x9, =dcache_clean_all
+    blr     x9
+    mrs     x9, mpidr_el1
+    ubfx    x9, x9, #8, #8
+    adr     x10, xnu_park_flags
+    ldr     w11, =0x4b524150     /* "PARK" */
+    str     w11, [x10, x9, lsl #2]
+    dsb     sy
+1:  wfe
+    b       1b
+    .ltorg
+    .align  3
+xnu_park_flags:
+    .space  8 * 4
+xnu_park_pen_end:
 
 /* A core started here (RETURN_CPUS's test of PSCI CPU_ON after XNU) switches itself straight off again. */
 cpu_off_entry:

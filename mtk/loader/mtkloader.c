@@ -72,6 +72,13 @@
 #ifndef RETURN_CPUS
 #define RETURN_CPUS         0
 #endif
+/* 1 (MT6781): XNU's other cores end the run in a pen (start.S, xnu_park_pen) instead of switched off, since a core
+ * switched off cannot be switched on again here: the pen goes where Linux does not write -- the end of LK's framebuffer
+ * reservation (mblock-15, 0x771b0000 + 0x1e50000), past its three pictures of 0xa18000 -- and XNU gets loader_park=. */
+#ifndef XNU_PARK
+#define XNU_PARK            0
+#endif
+#define PARK_PA             0x78ff8000ULL
 /*
  * How many processors the device tree offers the kernel. It takes them from the head of
  * core_order below, so what is left of that list is nobody's but ours -- the watcher takes the
@@ -1533,6 +1540,61 @@ static void read_screen(void)
  * XNU is back (start.S xnu_return_stub): MMU off, our vectors, our stack. Its log was
  * linearized and written back to RAM by XNU. Save it, show its end, then reset into Android.
  */
+#if XNU_PARK && SOC_IS_MT6781
+extern char xnu_park_pen[], xnu_park_pen_end[], xnu_park_flags[];
+
+/* the pen copied to PARK_PA, its slots cleared, " loader_park=<PARK_PA>" on the command line */
+static void xnu_park_setup(char *cl)
+{
+	static const char key[] = " loader_park=";
+	volatile uint32_t *dst = (volatile uint32_t *)PARK_PA;
+	const volatile uint32_t *src = (const volatile uint32_t *)xnu_park_pen;
+	uint64_t v = PARK_PA;
+	char d[24];
+	uint32_t at = 0, n = 0;
+
+	for (uint64_t i = 0; i < (uint64_t)(xnu_park_pen_end - xnu_park_pen) / 4; i++) {
+		dst[i] = src[i];
+	}
+	__asm__ volatile("dsb sy");
+	while (cl[at]) {
+		at++;
+	}
+	do {
+		d[n++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v);
+	if (at + sizeof(key) - 1 + n >= BOOT_LINE_LENGTH) {
+		out("park: no room on the command line\n");
+		return;
+	}
+	for (uint32_t i = 0; key[i]; i++) {
+		cl[at++] = key[i];
+	}
+	while (n) {
+		cl[at++] = d[--n];
+	}
+	cl[at] = 0;
+	out("park: the pen for XNU's other cores at ");
+	out_hex(PARK_PA);
+	out("\n");
+}
+
+static void say_parked(void)
+{
+	const volatile uint32_t *slot = (const volatile uint32_t *)(PARK_PA + (uint64_t)(xnu_park_flags - xnu_park_pen));
+
+	out("parked in the pen:");
+	for (int c = 0; c < 8; c++) {
+		if (slot[c] == 0x4b524150u) {
+			out(" ");
+			out_dec(c);
+		}
+	}
+	out("\n");
+}
+#endif
+
 #if RETURN_CPUS
 /* PSCI AFFINITY_INFO (SMC64): 0 on, 1 off, 2 turning on, negative an error */
 static int64_t psci_affinity_info(uint64_t mpidr)
@@ -1670,6 +1732,9 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 			}
 		}
 		__asm__ volatile("msr S3_0_C12_C12_7, xzr; isb");    /* ICC_IGRPEN1_EL1 */
+#if XNU_PARK && SOC_IS_MT6781
+		say_parked();
+#endif
 #if RETURN_CPUS
 		say_cpus();
 		{
@@ -2535,6 +2600,9 @@ static void __attribute__((noreturn)) run_xnu(void)
 #endif
 #if XNU_TOUCH_ILI && SOC_IS_MT6781
 	ili_xnu_args(ba->commandLine);
+#endif
+#if XNU_PARK && SOC_IS_MT6781
+	xnu_park_setup(ba->commandLine);
 #endif
 
 	out("md0 ");

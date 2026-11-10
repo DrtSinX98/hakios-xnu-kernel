@@ -60,6 +60,7 @@
 
 extern void loader_return(void);
 extern void loader_log_putc(char c);
+extern void loader_park(void);
 extern unsigned long gVirtBase, gPhysBase;
 
 /* The firmware is called with HVC, not SMC. (start.s reads this too, at its physical address.) */
@@ -240,6 +241,7 @@ psci_smp_cpu_off(void)
 	os_atomic_store(&psci_smp_cpu_stage[cpu_number()], PSCI_SMP_CPU_OFF, release);
 	__builtin_arm_dsb(DSB_SY);
 
+	loader_park();          /* loader_park=: into the loader's pen instead (returns when there is none) */
 	(void) psci_call(PSCI_CPU_OFF, 0, 0, 0);
 	for (;;) {
 		__builtin_arm_wfi();    /* the firmware refused: stay out of the way all the same */
