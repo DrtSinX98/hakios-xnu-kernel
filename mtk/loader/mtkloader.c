@@ -103,6 +103,11 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef PASS_THROUGH
 #define PASS_THROUGH        0
 #endif
+/* 1 (with PASS_THROUGH): before Android, log what a new SoC's loader needs into ramoops: EL, MPIDR,
+ * the watchdog's mode, LK's OVL0 layer, the marker. Reads only. */
+#ifndef SOC_PROBE
+#define SOC_PROBE           0
+#endif
 #ifndef MENU_DEFAULT_XNU
 #define MENU_DEFAULT_XNU    0
 #endif
@@ -3391,6 +3396,56 @@ rails_off:
 }
 #endif /* GPU_PROBE */
 
+#if SOC_PROBE
+/* MT6781's OVL0 (the Hot 20's OVL0_BASE is disp_ccorr0 there); only OVL0: LK's display path keeps it clocked */
+#define PROBE_OVL0          0x14005000ULL
+#define PROBE_OVL_L0_SRC_SIZE 0x038      /* height << 16 | width */
+
+static void probe_reg(const char *name, uint64_t pa)
+{
+	out("probe: ");
+	out(name);
+	out(" ");
+	out_hex(rd32(pa));
+	out("\n");
+}
+
+static void soc_probe(void)
+{
+	uint64_t el, mpidr;
+
+	__asm__ volatile("mrs %0, CurrentEL" : "=r"(el));
+	__asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+	out("probe: EL ");
+	out_dec(el >> 2);
+	out(" MPIDR ");
+	out_hex(mpidr);
+	out("\n");
+	probe_reg("TOPRGU MODE", TOPRGU_MODE);
+	probe_reg("TOPRGU LENGTH", TOPRGU_LENGTH);
+	probe_reg("OVL0 SRC_CON", PROBE_OVL0 + OVL_SRC_CON);
+	/* each layer's registers are 0x20 above the one before; LK's framebuffer is on one of them */
+	for (uint32_t n = 0; n < 4; n++) {
+		uint64_t l = PROBE_OVL0 + 0x20 * n;
+
+		out("probe: OVL0 L");
+		out_dec(n);
+		out(" CON ");
+		out_hex(rd32(l + OVL_L0_CON));
+		out(" SRC_SIZE ");
+		out_hex(rd32(l + PROBE_OVL_L0_SRC_SIZE));
+		out(" PITCH ");
+		out_hex(rd32(l + OVL_L0_PITCH));
+		out(" ADDR ");
+		out_hex(rd32(l + OVL_L0_ADDR));
+		out("\n");
+	}
+	probe_reg("marker 0", MARKER_PA);
+	probe_reg("marker 1", MARKER_PA + 64);
+	probe_reg("marker 2", MARKER_PA + 128);
+}
+#endif
+
 void mtkloader_main(uint64_t dtb)
 {
 #if PASS_THROUGH
@@ -3399,6 +3454,9 @@ void mtkloader_main(uint64_t dtb)
 	out("mtkloader: pass-through, LK dtb ");
 	out_hex(dtb);
 	out("\n");
+#if SOC_PROBE
+	soc_probe();
+#endif
 	chain_android();
 #endif
 	uint32_t mark = marker_get();
