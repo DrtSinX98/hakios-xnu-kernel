@@ -61,6 +61,11 @@
 #ifndef XNU_WATCH_SECONDS
 #define XNU_WATCH_SECONDS   0
 #endif
+/* 1: when XNU comes back, the watchdog is restarted, not switched off: it stays the backstop while the log is saved and
+ * Android is started (Android's own watchdog driver takes it over); a hang there resets into Android. 0: off. */
+#ifndef XNU_RETURN_WDT
+#define XNU_RETURN_WDT      0
+#endif
 /*
  * How many processors the device tree offers the kernel. It takes them from the head of
  * core_order below, so what is left of that list is nobody's but ours -- the watcher takes the
@@ -81,7 +86,13 @@ _Static_assert(XNU_CORES >= 1 && XNU_CORES <= 7, "one core at least, and one lef
  * leaves us on core 0), then the two Cortex-A75s, which are about twice the Cortex-A55s, then
  * the rest of the A55s. So "cpus=3" already gives iOS both fast cores.
  */
+#if SOC_IS_MT6781
+/* the realme 8i: its six Cortex-A55s first; the two A76s (6, 7) last, their clock is not set up here (big_cores_clock
+ * is the Hot 20's) */
+static const uint8_t core_order[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+#else
 static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
+#endif
 #define WATCH_CORE          core_order[XNU_CORES]
 /* Checkpoint for XNU to return at (osfmk/arm/arm_init.c LOADER_CHECKPOINT), 0 = none. */
 #ifndef XNU_CHECKPOINT
@@ -1520,7 +1531,11 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 {
 	struct span sp = { (const volatile char *)log_pa, len };
 
+#if XNU_RETURN_WDT
+	wr32(TOPRGU_RESTART, TOPRGU_RESTART_KEY);       /* its full length again, from here */
+#else
 	wdt_disable();
+#endif
 	xnu_back = 1;
 	marker_set(MARK_DONE);
 	uint64_t screen = fbc.base;
