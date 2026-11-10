@@ -126,6 +126,11 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #if XNU_UFS && SOC_IS_MT6781
 static void xnu_ufs_args(char *cl);
 #endif
+/* 1 (MT6781): with volume down held at the prompt, the touch controller on SPI4 as LK leaves it, one read with nothing
+ * written, and its ID through ICE mode with the MCU running (mtkili.h); then Android. No reset. */
+#ifndef ILI_PROBE
+#define ILI_PROBE           0
+#endif
 /* 1: read the eMMC and report, then go back to Android (no XNU). */
 #ifndef MSDC_TEST
 #define MSDC_TEST           0
@@ -3959,6 +3964,10 @@ static void xnu_ufs_args(char *cl)
 }
 #endif
 
+#if ILI_PROBE && SOC_IS_MT6781
+#include "mtkili.h"
+#endif
+
 void mtkloader_main(uint64_t dtb)
 {
 #if PASS_THROUGH
@@ -4005,6 +4014,15 @@ void mtkloader_main(uint64_t dtb)
 		dbg_delay_ms(11000);
 #endif
 		dbg_delay_ms(4000);
+	}
+	chain_android();
+#endif
+#if ILI_PROBE && SOC_IS_MT6781
+	if (volume_down_held("the touch probe")) {
+		out("== mtkloader: ILI7807S touch probe ==\n");
+		ili_probe();
+		out("ili: probe done\n");
+		dbg_delay_ms(15000);        /* on screen, to be photographed */
 	}
 	chain_android();
 #endif
