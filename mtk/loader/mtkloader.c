@@ -118,6 +118,14 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef UFS_READ_TEST
 #define UFS_READ_TEST       0
 #endif
+/* 1 (MT6781): on the way to XNU, find xnusys in the user unit's GPT through LK's transfer list (reads only) and give
+ * the kernel's UFS driver its extent and LK's list: mtkufs_lba=, mtkufs_blocks=, mtkufs_lkutrl= on the command line. */
+#ifndef XNU_UFS
+#define XNU_UFS             0
+#endif
+#if XNU_UFS && SOC_IS_MT6781
+static void xnu_ufs_args(char *cl);
+#endif
 /* 1: read the eMMC and report, then go back to Android (no XNU). */
 #ifndef MSDC_TEST
 #define MSDC_TEST           0
@@ -2390,6 +2398,9 @@ static void __attribute__((noreturn)) run_xnu(void)
 			out("\n");
 		}
 	}
+#if XNU_UFS && SOC_IS_MT6781
+	xnu_ufs_args(ba->commandLine);
+#endif
 
 	out("md0 ");
 	out_hex(sys_size ? sys_pa : rd_pa);
@@ -3637,6 +3648,9 @@ static void key_probe(void)
 }
 #endif
 
+#if (UFS_PROBE || XNU_UFS) && SOC_IS_MT6781
+#define UFSHCI_BASE         0x11270000ULL
+#endif
 #if UFS_PROBE && SOC_IS_MT6781
 /*
  * Read only. The MT6781's UFS host controller (ufshci@11270000, "mediatek,mt8183-ufshci": standard UFSHCI
@@ -3644,8 +3658,6 @@ static void key_probe(void)
  * kernel, with no shutdown in its log. Also LK's first UTP transfer request descriptor and the command descriptor
  * it points to, in DRAM, to see the list LK set up.
  */
-#define UFSHCI_BASE         0x11270000ULL
-
 static void ufs_probe(void)
 {
 	static const struct { const char *name; uint32_t at; } regs[] = {
@@ -3686,57 +3698,73 @@ static void ufs_probe(void)
 	}
 }
 
-#if UFS_READ_TEST
-/*
- * One 4 KiB read, the UFSHCI way (JESD223; Linux's ufshcd lays it out the same): a UTP transfer request descriptor
- * in slot 0 of LK's list, pointing at a command descriptor here -- the COMMAND UPIU at 0, the RESPONSE UPIU at
- * 512, one PRDT entry at 1024, offsets in dwords -- with the CDB READ(10) of LBA 1, one block, LUN 2 (the user unit,
- * 15620096 blocks of 4096 bytes). The MMU is off, so the controller and this code see the same memory. Nothing of the
- * controller's setup is changed: only the descriptor, doorbell bit 0 and, after, the completion bit in IS.
- */
-static uint8_t ufs_ucd[1024 + 16] __attribute__((aligned(128)));
-static uint8_t ufs_data[4096] __attribute__((aligned(4096)));
+#endif
 
-static int ufs_read_test(void)
+#if (UFS_READ_TEST || XNU_UFS) && SOC_IS_MT6781
+/*
+ * Reads, the UFSHCI way (JESD223; Linux's ufshcd lays it out the same): a UTP transfer request descriptor in slot 0
+ * of LK's list, pointing at a command descriptor here -- the COMMAND UPIU at 0, the RESPONSE UPIU at 512, one PRDT
+ * entry at 1024, offsets in dwords -- with the CDB READ(10), LUN 2 (the user unit, 15620096 blocks of 4096 bytes). The
+ * MMU is off, so the controller and this code see the same memory. Nothing of the controller's setup is changed: only
+ * the descriptor, doorbell bit 0 and, after, the completion bit in IS.
+ */
+#define UFS_BLOCK           4096u
+static uint8_t ufs_ucd[1024 + 16] __attribute__((aligned(128)));
+static uint8_t ufs_data[4 * UFS_BLOCK] __attribute__((aligned(4096)));
+
+/* LK's list, if the controller is as the probe saw it (device present, lists ready, nothing in flight, running); else 0 */
+static uint64_t ufs_lk_list(void)
 {
 	const uint64_t utrl = rd32(UFSHCI_BASE + 0x50) | (uint64_t)rd32(UFSHCI_BASE + 0x54) << 32;
-	volatile uint32_t *utrd = (volatile uint32_t *)utrl;
-	volatile uint8_t *cmd = ufs_ucd, *rsp = ufs_ucd + 512;
-	volatile uint32_t *prdt = (volatile uint32_t *)(ufs_ucd + 1024);
-	const uint32_t lba = 1;
-	uint32_t t;
 
 	if ((rd32(UFSHCI_BASE + 0x30) & 0xf) != 0xf || rd32(UFSHCI_BASE + 0x58) != 0 || rd32(UFSHCI_BASE + 0x60) != 1 ||
 	    utrl < 0x40000000ULL || utrl >= 0x140000000ULL) {
 		out("ufs read: the controller is not as the probe saw it; nothing sent\n");
 		return 0;
 	}
+	return utrl;
+}
+
+/* Blocks [lba, lba + n) of LUN 2 into ufs_data, n <= 4. 0: done, good status; 1: no completion (slot cleared, list
+ * stopped); 2: completed with an error. */
+static int ufs_lk_read(uint64_t utrl, uint32_t lba, uint32_t n)
+{
+	volatile uint32_t *utrd = (volatile uint32_t *)utrl;
+	volatile uint8_t *cmd = ufs_ucd, *rsp = ufs_ucd + 512;
+	volatile uint32_t *prdt = (volatile uint32_t *)(ufs_ucd + 1024);
+	const uint32_t bytes = n * UFS_BLOCK;
+	uint32_t t;
+
+	if (n == 0 || n > 4) {
+		return 2;
+	}
 	for (uint32_t i = 0; i < sizeof(ufs_ucd); i++) {
 		ufs_ucd[i] = 0;
 	}
-	for (uint32_t i = 0; i < sizeof(ufs_data); i++) {
+	for (uint32_t i = 0; i < bytes; i++) {
 		ufs_data[i] = 0xa5;
 	}
-	/* COMMAND UPIU: type 0x01, flags R, LUN 2, task tag 0; expected length 4096 (big-endian); CDB READ(10) */
+	/* COMMAND UPIU: type 0x01, flags R, LUN 2, task tag 0; expected length (big-endian); CDB READ(10) */
 	cmd[0] = 0x01;
 	cmd[1] = 0x40;
 	cmd[2] = 2;
 	cmd[3] = 0;
-	cmd[12] = 0x00;
-	cmd[13] = 0x00;
-	cmd[14] = 0x10;
-	cmd[15] = 0x00;
+	cmd[12] = (uint8_t)(bytes >> 24);
+	cmd[13] = (uint8_t)(bytes >> 16);
+	cmd[14] = (uint8_t)(bytes >> 8);
+	cmd[15] = (uint8_t)bytes;
 	cmd[16] = 0x28;
 	cmd[18] = (uint8_t)(lba >> 24);
 	cmd[19] = (uint8_t)(lba >> 16);
 	cmd[20] = (uint8_t)(lba >> 8);
 	cmd[21] = (uint8_t)lba;
-	cmd[24] = 1;                    /* one block */
+	cmd[23] = (uint8_t)(n >> 8);
+	cmd[24] = (uint8_t)n;
 	/* PRDT: the data buffer, byte count - 1 */
 	prdt[0] = (uint32_t)(uint64_t)ufs_data;
 	prdt[1] = (uint32_t)((uint64_t)ufs_data >> 32);
 	prdt[2] = 0;
-	prdt[3] = sizeof(ufs_data) - 1;
+	prdt[3] = bytes - 1;
 	/* UTRD, slot 0: UFS storage command, device to host, no interrupt; OCS 0xf until the controller writes it */
 	utrd[0] = (1u << 28) | 0x04000000u;
 	utrd[1] = 0;
@@ -3768,9 +3796,11 @@ static int ufs_read_test(void)
 		out(")\n");
 		return 1;
 	}
-	out("ufs read: ");
-	out((rd32(UFSHCI_BASE + 0x58) & 1) ? "NO COMPLETION in 1 s" : "completed");
-	out(" after ");
+	out("ufs read: LBA ");
+	out_dec(lba);
+	out("+");
+	out_dec(n);
+	out(" completed after ");
 	out_dec(t);
 	out(" ms, OCS ");
 	out_hex(utrd[2] & 0xff);
@@ -3784,23 +3814,137 @@ static int ufs_read_test(void)
 	out_hex(rsp[7]);
 	out("\n");
 	wr32(UFSHCI_BASE + 0x20, 1);      /* UTRCS, write 1 to clear */
+	return (utrd[2] & 0xff) == 0 && rsp[0] == 0x21 && rsp[6] == 0 && rsp[7] == 0 ? 0 : 2;
+}
+
+/* little-endian, from the GPT */
+static uint64_t ufs_le(const volatile uint8_t *p, int n)
+{
+	uint64_t v = 0;
+
+	for (int i = n - 1; i >= 0; i--) {
+		v = v << 8 | p[i];
+	}
+	return v;
+}
+#endif
+
+#if UFS_READ_TEST && UFS_PROBE && SOC_IS_MT6781
+/* One 4 KiB read: LBA 1, the GPT header. */
+static int ufs_read_test(void)
+{
+	const uint64_t utrl = ufs_lk_list();
 	volatile uint8_t *data = ufs_data;
 
+	if (utrl == 0) {
+		return 0;
+	}
+	if (ufs_lk_read(utrl, 1, 1) == 1) {
+		return 1;
+	}
 	out("ufs read: LBA 1 starts \"");
 	for (uint32_t i = 0; i < 8; i++) {
 		char c[2] = { (data[i] >= 0x20 && data[i] < 0x7f) ? (char)data[i] : '.', 0 };
 		out(c);
 	}
-	uint64_t alt = 0;
-	for (int i = 7; i >= 0; i--) {
-		alt = alt << 8 | data[32 + i];
-	}
+	uint64_t alt = ufs_le(data + 32, 8);
 	out("\", backup header at LBA ");
 	out_dec(alt);
 	out(alt == 15620095 ? " (as the GPT says)\n" : " (NOT 15620095)\n");
 	return 0;
 }
 #endif
+
+#if XNU_UFS && SOC_IS_MT6781
+static char *cl_put(char *at, const char *s)
+{
+	while (*s) {
+		*at++ = *s++;
+	}
+	*at = 0;
+	return at;
+}
+
+static char *cl_dec(char *at, uint64_t v)
+{
+	char d[24];
+	int n = 0;
+
+	do {
+		d[n++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v);
+	while (n) {
+		*at++ = d[--n];
+	}
+	*at = 0;
+	return at;
+}
+
+/*
+ * xnusys, found in the user unit's GPT (header at LBA 1, its entries after), for the kernel's UFS driver
+ * (mtk/mt6781/drivers/storage/hakios.mt6781_ufs.c): " mtkufs_lba=<first block> mtkufs_blocks=<count>
+ * mtkufs_lkutrl=<LK's list>" onto the command line. When anything is not as expected nothing is added, and the
+ * driver then leaves the controller alone.
+ */
+static void xnu_ufs_args(char *cl)
+{
+	static const char name[] = "xnusys";
+	const volatile uint8_t *d = ufs_data;
+	uint64_t utrl = ufs_lk_list(), alt, entries, first = 0, last = 0;
+	uint32_t count, size;
+	char *at = cl;
+
+	if (utrl == 0 || ufs_lk_read(utrl, 1, 1) != 0 || memcmp_n(d, "EFI PART", 8) != 0) {
+		out("xnu ufs: no GPT header at LBA 1 of LUN 2; no mtkufs_ arguments\n");
+		return;
+	}
+	alt = ufs_le(d + 32, 8);
+	entries = ufs_le(d + 72, 8);
+	count = (uint32_t)ufs_le(d + 80, 4);
+	size = (uint32_t)ufs_le(d + 84, 4);
+	if (size != 128 || count == 0 || count > 128 || entries < 2 || entries + 4 > alt ||
+	    ufs_lk_read(utrl, (uint32_t)entries, (count * size + UFS_BLOCK - 1) / UFS_BLOCK) != 0) {
+		out("xnu ufs: the GPT's entries not read; no mtkufs_ arguments\n");
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		const volatile uint8_t *e = d + i * size;
+		uint32_t k;
+
+		for (k = 0; name[k] && e[56 + 2 * k] == (uint8_t)name[k] && e[57 + 2 * k] == 0; k++) {
+		}
+		if (name[k] == 0 && e[56 + 2 * k] == 0 && e[57 + 2 * k] == 0) {
+			first = ufs_le(e + 32, 8);
+			last = ufs_le(e + 40, 8);
+			break;
+		}
+	}
+	if (first < entries + 4 || last < first || last >= alt || last > 0xffffffffULL) {
+		out("xnu ufs: no usable xnusys in the GPT; no mtkufs_ arguments\n");
+		return;
+	}
+	while (*at) {
+		at++;
+	}
+	if ((uint32_t)(at - cl) + 80 >= BOOT_LINE_LENGTH) {
+		out("xnu ufs: no room on the command line; no mtkufs_ arguments\n");
+		return;
+	}
+	at = cl_put(at, " mtkufs_lba=");
+	at = cl_dec(at, first);
+	at = cl_put(at, " mtkufs_blocks=");
+	at = cl_dec(at, last - first + 1);
+	at = cl_put(at, " mtkufs_lkutrl=");
+	cl_dec(at, utrl);
+	out("xnu ufs: xnusys at LBA ");
+	out_dec(first);
+	out(", ");
+	out_dec(last - first + 1);
+	out(" blocks; LK's list ");
+	out_hex(utrl);
+	out("\n");
+}
 #endif
 
 void mtkloader_main(uint64_t dtb)
