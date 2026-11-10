@@ -19,7 +19,8 @@
  *
  * Read only by construction: one check (mufs_refusal) before anything goes into a slot -- READ(10), READ CAPACITY(10),
  * TEST UNIT READY, nothing else; LUN 2 only; data from the device or none, never the W flag; a READ(10)'s blocks
- * inside xnusys's extent. What the slot then holds is read back and must pass again before the doorbell. Slot 0 holds
+ * inside xnusys's extent, or, only while the start checks that extent against the GPT itself (mufs_gpt_check), inside
+ * the primary GPT (blocks 1..5); a disagreement with mtkloader and nothing more is read. What the slot then holds is read back and must pass again before the doorbell. Slot 0 holds
  * the proof (a TEST UNIT READY that must come back in this list after the switch), slot 1 the reads, the others a
  * TEST UNIT READY that is never rung. Data goes through one contiguous bounce buffer, cleaned and invalidated around
  * every read. The doorbell is rung and waited for with interrupts off.
@@ -103,6 +104,9 @@ void hakios_mt6781_ufs_quiesce(void);
 #define BLOCK               4096u
 #define SECTOR              512u                /* what the block device says its block is (as the Hot 20's) */
 #define TIMEOUT_US          1000000
+#define GPT_HEADER          1                   /* the primary GPT, as gpt-carve.py lays it for 4096-byte blocks */
+#define GPT_ENTRIES         2
+#define GPT_ENTRY_BLOCKS    4                   /* 128 entries of 128 bytes */
 
 struct mufs_cmd {
 	uint8_t upiu[32];
@@ -115,8 +119,11 @@ static vm_offset_t mufs_ucd;                    /* the command descriptors, not 
 static uint64_t mufs_area_pa, mufs_bounce_pa;
 static uint8_t *mufs_bounce;                    /* cached; cleaned and invalidated around every read */
 static uint64_t part_lba, part_blocks, lk_utrl; /* from mtkloader */
+static uint64_t dev_blocks;                     /* what the device says it is: xnusys's APFS containers, else all of it */
+static bool apfs_found;
 static uint32_t cnr_in;
 static bool started, usable, in, dead;
+static bool gpt_window;                         /* the primary GPT readable: only inside mufs_gpt_check */
 static int bmajor = -1, cmajor = -1;
 static uint64_t mufs_reads, mufs_errors, mufs_refused;
 static LCK_GRP_DECLARE(mufs_lck_grp, "hakios-mt6781-ufs");
@@ -204,6 +211,9 @@ mufs_refusal(const uint8_t *upiu, uint32_t dw0)
 		if (n == 0 || expected != n * BLOCK) {
 			return "a read whose length is not what the UPIU expects";
 		}
+		if (gpt_window && lba >= GPT_HEADER && lba + n <= GPT_ENTRIES + GPT_ENTRY_BLOCKS) {
+			return NULL;
+		}
 		if (lba < part_lba || lba - part_lba >= part_blocks || n > part_blocks - (lba - part_lba)) {
 			return "a read outside xnusys";
 		}
@@ -288,7 +298,7 @@ mufs_selftest(void)
 {
 	static const struct {
 		uint8_t op, flags, lun, type;
-		int64_t at;             /* the READ(10)'s first block, from xnusys's start (-1: before it) */
+		int64_t at;             /* the READ(10)'s first block, from xnusys's start (-1 before it, -4 the GPT header) */
 		int32_t blocks;         /* its length; <0: from xnusys's end */
 		uint32_t dd;
 		bool pass;
@@ -300,6 +310,7 @@ mufs_selftest(void)
 		{ 0x28, UPIU_FLAG_READ, 2, UPIU_COMMAND, -1, 1, UTRD_DD_IN, false, "READ(10) of the block before it" },
 		{ 0x28, UPIU_FLAG_READ, 2, UPIU_COMMAND, -2, 2, UTRD_DD_IN, false, "READ(10) across its end" },
 		{ 0x28, UPIU_FLAG_READ, 2, UPIU_COMMAND, -3, 1, UTRD_DD_IN, false, "READ(10) of the block after it" },
+		{ 0x28, UPIU_FLAG_READ, 2, UPIU_COMMAND, -4, 1, UTRD_DD_IN, false, "READ(10) of the GPT header outside its check" },
 		{ 0x28, UPIU_FLAG_READ, 0, UPIU_COMMAND, 0, 1, UTRD_DD_IN, false, "READ(10) of LUN 0" },
 		{ 0x28, UPIU_FLAG_READ, 3, UPIU_COMMAND, 0, 1, UTRD_DD_IN, false, "READ(10) of LUN 3" },
 		{ 0x28, UPIU_FLAG_READ, 0xc4, UPIU_COMMAND, 0, 1, UTRD_DD_IN, false, "READ(10) of the RPMB unit" },
@@ -323,7 +334,7 @@ mufs_selftest(void)
 
 	for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 		uint64_t lba = cases[i].at == -1 ? part_lba - 1 : cases[i].at == -2 ? part_lba + part_blocks - 1 :
-		    cases[i].at == -3 ? part_lba + part_blocks : part_lba + (uint64_t)cases[i].at;
+		    cases[i].at == -3 ? part_lba + part_blocks : cases[i].at == -4 ? GPT_HEADER : part_lba + (uint64_t)cases[i].at;
 		uint32_t n = cases[i].blocks > 0 ? (uint32_t)cases[i].blocks : 1;
 		bool passed;
 
@@ -565,6 +576,25 @@ mufs_switch_in(void)
 
 /* ---- reading ---- */
 
+/* blocks [lba, lba + blocks) of LUN 2 into the bounce buffer (mufs_lock held) */
+static int
+read_abs(uint64_t lba, uint32_t blocks, const char *what)
+{
+	struct mufs_cmd c;
+	int error;
+
+	make_read(&c, (uint32_t)lba, blocks);
+	/* nothing of the buffer left in a cache to be written back over what the controller writes */
+	FlushPoC_DcacheRegion((vm_offset_t)mufs_bounce, (size_t)blocks * BLOCK);
+	error = mufs_place(SLOT_READ, &c, blocks * BLOCK);
+	if (error == 0) {
+		error = mufs_ring(SLOT_READ, what);
+	}
+	/* and nothing read before the controller wrote it */
+	FlushPoC_DcacheRegion((vm_offset_t)mufs_bounce, (size_t)blocks * BLOCK);
+	return error;
+}
+
 /* bytes [offset, offset + len) of xnusys into dst, through the bounce buffer, a slot's worth at a time */
 static int
 mufs_read(uint64_t offset, uint8_t *dst, uint64_t len)
@@ -577,7 +607,6 @@ mufs_read(uint64_t offset, uint8_t *dst, uint64_t len)
 	lck_mtx_lock(&mufs_lock);
 	while (len > 0 && error == 0) {
 		uint64_t first = offset / BLOCK, skip = offset % BLOCK, blocks = (skip + len + BLOCK - 1) / BLOCK, take;
-		struct mufs_cmd c;
 		char what[48];
 
 		if (blocks > BOUNCE / BLOCK) {
@@ -587,16 +616,8 @@ mufs_read(uint64_t offset, uint8_t *dst, uint64_t len)
 		if (take > len) {
 			take = len;
 		}
-		make_read(&c, (uint32_t)(part_lba + first), (uint32_t)blocks);
-		/* nothing of the buffer left in a cache to be written back over what the controller writes */
-		FlushPoC_DcacheRegion((vm_offset_t)mufs_bounce, (size_t)blocks * BLOCK);
-		error = mufs_place(SLOT_READ, &c, (uint32_t)blocks * BLOCK);
-		if (error == 0) {
-			snprintf(what, sizeof(what), "xnusys blocks %llu..%llu", first, first + blocks - 1);
-			error = mufs_ring(SLOT_READ, what);
-		}
-		/* and nothing read before the controller wrote it */
-		FlushPoC_DcacheRegion((vm_offset_t)mufs_bounce, (size_t)blocks * BLOCK);
+		snprintf(what, sizeof(what), "xnusys blocks %llu..%llu", first, first + blocks - 1);
+		error = read_abs(part_lba + first, (uint32_t)blocks, what);
 		if (error == 0) {
 			memcpy(dst, mufs_bounce + skip, take);
 			mufs_reads++;
@@ -609,6 +630,106 @@ mufs_read(uint64_t offset, uint8_t *dst, uint64_t len)
 	}
 	lck_mtx_unlock(&mufs_lock);
 	return error;
+}
+
+static uint64_t
+le(const uint8_t *p, int n)
+{
+	uint64_t v = 0;
+
+	for (int i = n - 1; i >= 0; i--) {
+		v = v << 8 | p[i];
+	}
+	return v;
+}
+
+/*
+ * xnusys's extent as the GPT itself has it (header and entries, both CRCs checked), against mtkloader's: the reads
+ * are not confined to xnusys until both agree.
+ */
+static bool
+mufs_gpt_check(void)
+{
+	static uint8_t hdr[BLOCK];
+	static const char name[] = "xnusys";
+	const uint8_t *ent = mufs_bounce;
+	const char *no = NULL;
+	uint64_t entries = 0, first = 0, last = 0;
+	uint32_t hsize = 0, hcrc, count = 0, esize = 0, ecrc;
+	int e;
+
+	lck_mtx_lock(&mufs_lock);
+	gpt_window = true;
+	e = read_abs(GPT_HEADER, 1, "the GPT header");
+	if (e == 0) {
+		memcpy(hdr, mufs_bounce, BLOCK);
+		e = read_abs(GPT_ENTRIES, GPT_ENTRY_BLOCKS, "the GPT entries");
+	}
+	gpt_window = false;
+	if (e != 0) {
+		no = "the GPT could not be read";
+	} else if (memcmp(hdr, "EFI PART", 8) != 0) {
+		no = "no GPT signature at block 1";
+	} else {
+		hsize = (uint32_t)le(hdr + 12, 4);
+		hcrc = (uint32_t)le(hdr + 16, 4);
+		entries = le(hdr + 72, 8);
+		count = (uint32_t)le(hdr + 80, 4);
+		esize = (uint32_t)le(hdr + 84, 4);
+		ecrc = (uint32_t)le(hdr + 88, 4);
+		if (hsize < 92 || hsize > BLOCK) {
+			no = "a header size out of range";
+		} else {
+			bzero(hdr + 16, 4);
+			if (crc32(0, hdr, hsize) != hcrc) {
+				no = "the header's CRC is wrong";
+			}
+		}
+		if (no == NULL && (entries != GPT_ENTRIES || esize != 128 || count == 0 || count * esize > GPT_ENTRY_BLOCKS * BLOCK)) {
+			no = "the entries are not at block 2, 128 bytes each, in 4 blocks";
+		} else if (no == NULL && crc32(0, ent, count * esize) != ecrc) {
+			no = "the entries' CRC is wrong";
+		}
+		for (uint32_t i = 0; no == NULL && i < count; i++) {
+			const uint8_t *x = ent + i * esize;
+			uint32_t k;
+
+			for (k = 0; name[k] && x[56 + 2 * k] == (uint8_t)name[k] && x[57 + 2 * k] == 0; k++) {
+			}
+			if (name[k] == 0 && x[56 + 2 * k] == 0 && x[57 + 2 * k] == 0) {
+				first = le(x + 32, 8);
+				last = le(x + 40, 8);
+				break;
+			}
+		}
+		if (no == NULL && (first == 0 || last < first)) {
+			no = "no xnusys in the GPT";
+		} else if (no == NULL && (first != part_lba || last - first + 1 != part_blocks)) {
+			no = "xnusys in the GPT is not where mtkloader said";
+		}
+	}
+	lck_mtx_unlock(&mufs_lock);
+	if (no != NULL) {
+		printf("mtkufs: GPT check FAILED: %s (GPT: xnusys %llu..%llu, header %u bytes, %u entries of %u at %llu; mtkloader: "
+		    "%llu+%llu); not used\n", no, first, last, hsize, count, esize, entries, part_lba, part_blocks);
+		return false;
+	}
+	printf("mtkufs: GPT check: header and entries CRCs good, xnusys %llu..%llu, as mtkloader said\n", first, last);
+	return true;
+}
+
+/* not used after all: LK's list back now, and nothing more sent */
+static int
+mufs_give_up(void)
+{
+	uint32_t left, cnr;
+	boolean_t istate = ml_set_interrupts_enabled(FALSE);
+	bool ok = mufs_put_back(&left, &cnr);
+
+	ml_set_interrupts_enabled(istate);
+	dead = true;
+	printf("mtkufs: transfer list %s LK's %llx\n", ok ? "back to" : "NOT BACK TO", lk_utrl);
+	return ENXIO;
 }
 
 static const char *
@@ -702,8 +823,7 @@ mufs_start(void)
 	make_capacity(&c);
 	FlushPoC_DcacheRegion(bounce, PAGE_SIZE);
 	if (mufs_place(SLOT_READ, &c, 8) != 0 || mufs_ring(SLOT_READ, "READ CAPACITY(10)") != 0) {
-		dead = true;
-		return ENXIO;
+		return mufs_give_up();
 	}
 	FlushPoC_DcacheRegion(bounce, PAGE_SIZE);
 	cap8 = mufs_bounce;
@@ -712,10 +832,38 @@ mufs_start(void)
 	printf("mtkufs: READ CAPACITY(10): last block %u, %u bytes a block\n", lastlba, blen);
 	if (blen != BLOCK || part_lba + part_blocks - 1 > lastlba) {
 		printf("mtkufs: not used: xnusys does not fit the unit as it says it is\n");
-		dead = true;
-		return ENXIO;
+		return mufs_give_up();
+	}
+	if (!mufs_gpt_check()) {
+		return mufs_give_up();
 	}
 	usable = true;
+
+	/* the device as long as xnusys's APFS containers, back to back, as the Hot 20's eMMC driver has it (md0's size) */
+	dev_blocks = part_blocks;
+	for (uint64_t at = 0; at < part_blocks * BLOCK;) {
+		static uint32_t sb[BLOCK / 4];
+		uint64_t n;
+		uint32_t bs;
+
+		if (mufs_read(at, (uint8_t *)sb, BLOCK) != 0 || sb[8] != 0x4253584eu) {     /* "NXSB" */
+			if (at != 0) {
+				dev_blocks = at / BLOCK;
+			}
+			break;
+		}
+		bs = sb[9];
+		memcpy(&n, (uint8_t *)sb + 40, 8);
+		if (bs < BLOCK || bs > 65536 || bs % BLOCK || n == 0 || n > (part_blocks * BLOCK - at) / bs) {
+			dev_blocks = at != 0 ? at / BLOCK : part_blocks;
+			break;
+		}
+		at += n * bs;
+		dev_blocks = at / BLOCK;
+		apfs_found = true;
+	}
+	printf("mtkufs: /dev/mtkufs0 is %llu MB of xnusys's %llu MB (%s)\n", (dev_blocks * BLOCK) >> 20,
+	    (part_blocks * BLOCK) >> 20, apfs_found ? "its APFS containers" : "no APFS container: all of it");
 
 	/* the first blocks of xnusys, to set beside a dd of it from Android */
 	for (uint32_t b = 0; b < 4; b++) {
@@ -750,7 +898,7 @@ mufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unuse
 static void
 mufs_strategy(buf_t bp)
 {
-	uint64_t sectors = part_blocks * (BLOCK / SECTOR), at = (uint64_t)buf_blkno(bp);
+	uint64_t sectors = dev_blocks * (BLOCK / SECTOR), at = (uint64_t)buf_blkno(bp);
 	uint32_t count = buf_count(bp);
 	int error = 0;
 
@@ -782,7 +930,7 @@ mufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __u
 	case DKIOCSETBLOCKSIZE:
 		return *(uint32_t *)data == SECTOR ? 0 : EINVAL;
 	case DKIOCGETBLOCKCOUNT:
-		*(uint64_t *)data = part_blocks * (BLOCK / SECTOR);
+		*(uint64_t *)data = dev_blocks * (BLOCK / SECTOR);
 		return 0;
 	case DKIOCISWRITABLE:
 		*(uint32_t *)data = 0;
@@ -853,7 +1001,14 @@ mufs_devsw(void)
 int
 hakios_mtk_ufs_root(dev_t *root)
 {
-	if (mufs_start() != 0 || mufs_devsw() != 0) {
+	if (mufs_start() != 0) {
+		return ENXIO;
+	}
+	if (!apfs_found) {
+		printf("mtkufs: no APFS container at the start of xnusys (the system image is written there): not the root\n");
+		return ENXIO;
+	}
+	if (mufs_devsw() != 0) {
 		return ENXIO;
 	}
 	*root = makedev(bmajor, 0);
