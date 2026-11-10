@@ -108,6 +108,11 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef KEY_PROBE
 #define KEY_PROBE           0
 #endif
+/* 1 (MT6781): with volume down held at the prompt, read the UFS controller's registers and LK's first transfer
+ * request and report; then Android. Reads only. */
+#ifndef UFS_PROBE
+#define UFS_PROBE           0
+#endif
 /* 1: read the eMMC and report, then go back to Android (no XNU). */
 #ifndef MSDC_TEST
 #define MSDC_TEST           0
@@ -3084,11 +3089,13 @@ static int pmsg_take(const char *flag, uint32_t n)
  * So volume down, held while this asks, is a request too: keypad key 1, bit 1 of KP_MEM1, clear while the
  * key is down (KEY_PROBE). Three samples in a row, so that a bounce does not count.
  */
-static int volume_down_held(void)
+static int volume_down_held(const char *what)
 {
 	uint32_t run = 0;
 
-	out("hold volume down now for Darwin/XNU (3 s)\n");
+	out("hold volume down now for ");
+	out(what);
+	out(" (3 s)\n");
 	for (uint32_t t = 0; t < 30; t++) {
 		run = (rd32(0x10010004ULL) & (1u << 1)) ? 0 : run + 1;
 		if (run == 3) {
@@ -3105,7 +3112,7 @@ static int xnu_requested(void)
 	int asked = pmsg_take(boot_xnu_flag, sizeof(boot_xnu_flag) - 1);
 
 #if SOC_IS_MT6781
-	asked = asked || volume_down_held();
+	asked = asked || volume_down_held("Darwin/XNU");
 #endif
 	return asked;
 }
@@ -3625,6 +3632,56 @@ static void key_probe(void)
 }
 #endif
 
+#if UFS_PROBE && SOC_IS_MT6781
+/*
+ * Read only. The MT6781's UFS host controller (ufshci@11270000, "mediatek,mt8183-ufshci": standard UFSHCI
+ * registers, JESD223) as LK leaves it: LK brings UFS up early and its last use of it is just before it starts the
+ * kernel, with no shutdown in its log. Also LK's first UTP transfer request descriptor and the command descriptor
+ * it points to, in DRAM, to see the list LK set up.
+ */
+#define UFSHCI_BASE         0x11270000ULL
+
+static void ufs_probe(void)
+{
+	static const struct { const char *name; uint32_t at; } regs[] = {
+		{ "CAP", 0x00 }, { "VER", 0x08 }, { "IS", 0x20 }, { "IE", 0x24 }, { "HCS", 0x30 }, { "HCE", 0x34 },
+		{ "UECPA", 0x38 }, { "UECDL", 0x3c }, { "UECN", 0x40 }, { "UECT", 0x44 }, { "UECDME", 0x48 },
+		{ "UTRIACR", 0x4c }, { "UTRLBA", 0x50 }, { "UTRLBAU", 0x54 }, { "UTRLDBR", 0x58 }, { "UTRLRSR", 0x60 },
+		{ "UTMRLBA", 0x70 }, { "UTMRLBAU", 0x74 }, { "UTMRLDBR", 0x78 }, { "UTMRLRSR", 0x80 },
+	};
+
+	for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+		out("ufs probe: ");
+		out(regs[i].name);
+		out(" ");
+		out_hex(rd32(UFSHCI_BASE + regs[i].at));
+		out("\n");
+	}
+	uint64_t utrl = rd32(UFSHCI_BASE + 0x50) | (uint64_t)rd32(UFSHCI_BASE + 0x54) << 32;
+	if (utrl < 0x40000000ULL || utrl >= 0x140000000ULL) {
+		out("ufs probe: no transfer request list in DRAM\n");
+		return;
+	}
+	out("ufs probe: UTRD 0:");
+	for (uint32_t w = 0; w < 8; w++) {
+		out(" ");
+		out_hex(rd32(utrl + 4 * w));
+	}
+	out("\n");
+	uint64_t ucd = (rd32(utrl + 16) & ~0x7fu) | (uint64_t)rd32(utrl + 20) << 32;
+	if (ucd >= 0x40000000ULL && ucd < 0x140000000ULL) {
+		out("ufs probe: UCD 0 at ");
+		out_hex(ucd);
+		out(":");
+		for (uint32_t w = 0; w < 8; w++) {
+			out(" ");
+			out_hex(rd32(ucd + 4 * w));
+		}
+		out("\n");
+	}
+}
+#endif
+
 void mtkloader_main(uint64_t dtb)
 {
 #if PASS_THROUGH
@@ -3659,6 +3716,14 @@ void mtkloader_main(uint64_t dtb)
 	}
 
 	plog_reset();
+#if UFS_PROBE && SOC_IS_MT6781
+	if (volume_down_held("the UFS probe")) {
+		out("== mtkloader: UFS controller probe ==\n");
+		ufs_probe();
+		dbg_delay_ms(4000);
+	}
+	chain_android();
+#endif
 #if KEY_PROBE
 	key_probe();
 #endif
