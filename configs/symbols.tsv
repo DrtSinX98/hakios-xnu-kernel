@@ -55,7 +55,7 @@ BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,loader.c
 BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for the log (which number is which on this phone's firmware)
 BT	arg	bt	User space	k	hakios.bt.c	
 BT_AGAIN	arg	bt_again	User space	k	hakios.bt.c	the second look this many seconds later (0: no second look; 30)
-BUTTONS	arg	buttons	Touch and buttons	k	hakios.buttons.c,hakios.mtk_keys.c	
+BUTTONS	arg	buttons	Touch and buttons	k	hakios.buttons.c,hakios.mtk_keys.c,hakios.mt6781_keys.c	
 BUTTONS_STEPS	arg	buttons_steps	Touch and buttons	k	hakios.buttons.c	
 CA_VBL	arg	ca_vbl	User space	u	inject.c	CoreAnimation's frame clock from the display driver's refresh notifications
 CAENV	arg	caenv	User space	u	inject.c	
@@ -141,7 +141,7 @@ GPU_EXACT	arg	gpu_exact	GPU and display	k	hakios.adreno.c
 GPU_KEEP	arg	gpu_keep	GPU and display	k	hakios.gpu.cpp	
 GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c	
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
-KEYLOG	arg	keylog	Touch and buttons	k	hakios.mtk_keys.c	a line for every change, to check the wiring against
+KEYLOG	arg	keylog	Touch and buttons	k	hakios.mtk_keys.c,hakios.mt6781_keys.c	a line for every change, to check the wiring against
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	
 MALI	arg	mali	GPU and display	k	hakios.mali.c	every address below belongs to this phone (the other phone's GPU is an Adreno, bsd/dev/hakios.adreno.c)
 MALI_FASTMAP	arg	mali_fastmap	GPU and display	k	hakios.mali.c	

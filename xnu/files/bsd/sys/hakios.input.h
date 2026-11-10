@@ -45,6 +45,7 @@ void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power 
 /* MediaTek's (mtk/mt6768/drivers/, and the X6826B's touch screen in its device repository) */
 void hakios_tcm_init(void);            /* boot-arg touchscreen=2: a TD4160 touch screen (TCM protocol) on the MT6768's SPI */
 void hakios_mtk_keys_init(void);       /* boot-arg buttons=2: the MT6768's keypad; mtk_cpufreq=, mali_mhz=: its clocks */
+void hakios_mt6781_keys_init(void);    /* boot-arg buttons=3: the realme 8i's keypad and PMIC keys (mtk/mt6781/) */
 void hakios_mali_init(void);           /* boot-arg mali=1: the MT6768's Mali-G52 brought up */
 bool hakios_mali_ready(void);          /* ... and up: its jobs can be sent */
 void hakios_mtk_scp_init(void);        /* boot-arg scp_step=N: the MT6768's SCP (the sensor hub), steps 1 to N */

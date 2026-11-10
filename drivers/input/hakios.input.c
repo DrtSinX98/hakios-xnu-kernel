@@ -231,6 +231,7 @@ hakios_input_init(void)
 	hakios_tcm_init();
 	hakios_buttons_init();
 	hakios_mtk_keys_init();
+	hakios_mt6781_keys_init();
 	hakios_battery_init();
 	hakios_ufs_init();
 	hakios_net_init();

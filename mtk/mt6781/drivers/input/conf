@@ -1,0 +1,9 @@
+# mtk/mt6781/drivers/input/conf: the MT6781's keys.
+# CONFIG_HAKIOS_<NAME>=y in a defconfig builds a driver into the kernel (docs/drivers-config.md). MediaTek's drivers are
+# `default n`: a configuration has them only when it includes mt6781.config.
+
+driver MT6781_KEYS
+	file    bsd/dev/hakios.mt6781_keys.c
+	default n
+	help    the realme 8i's power and volume keys (buttons=3): volume down on the keypad at 0x10010000, volume up and power
+	help    on the MT6358 PMIC through its wrapper; reads only
