@@ -66,6 +66,12 @@
 #ifndef XNU_RETURN_WDT
 #define XNU_RETURN_WDT      0
 #endif
+/* 1: after XNU comes back, each core's state as PSCI has it (AFFINITY_INFO: reads only), on screen and in the log, and
+ * ten seconds to photograph it before Android: whether XNU's other cores were really switched off (cpus > 1). Then core 1
+ * switched on again (PSCI CPU_ON, into a stub that switches it straight off: start.S, cpu_off_entry), as Linux will. */
+#ifndef RETURN_CPUS
+#define RETURN_CPUS         0
+#endif
 /*
  * How many processors the device tree offers the kernel. It takes them from the head of
  * core_order below, so what is left of that list is nobody's but ours -- the watcher takes the
@@ -1527,6 +1533,33 @@ static void read_screen(void)
  * XNU is back (start.S xnu_return_stub): MMU off, our vectors, our stack. Its log was
  * linearized and written back to RAM by XNU. Save it, show its end, then reset into Android.
  */
+#if RETURN_CPUS
+/* PSCI AFFINITY_INFO (SMC64): 0 on, 1 off, 2 turning on, negative an error */
+static int64_t psci_affinity_info(uint64_t mpidr)
+{
+	register uint64_t x0 __asm__("x0") = 0xc4000004ULL;
+	register uint64_t x1 __asm__("x1") = mpidr;
+	register uint64_t x2 __asm__("x2") = 0;
+
+	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2)
+	    : : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+	return (int64_t)x0;
+}
+
+static void say_cpus(void)
+{
+	out("cores as PSCI has them:");
+	for (int c = 0; c < 8; c++) {
+		int64_t st = psci_affinity_info((uint64_t)c << 8);
+
+		out(" ");
+		out_dec(c);
+		out(st == 0 ? " on" : st == 1 ? " off" : st == 2 ? " turning-on" : " error");
+		out(c < 7 ? "," : "\n");
+	}
+}
+#endif
+
 void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code, uint64_t elr, uint64_t far)
 {
 	struct span sp = { (const volatile char *)log_pa, len };
@@ -1587,18 +1620,74 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 	if (SOC_IS_MT6781) {
 		/*
 		 * No reset: no DRAM survives one on the MT6781 (MARKER_TEST), so Android starts in this boot,
-		 * over the log just put in ramoops. XNU's loader_return left the other cores off (cpus=1), its
-		 * shared interrupts disabled, and the stub the MMU and caches off. What XNU quiets only with
-		 * bootcpu= is done here: its timer, and core 0's redistributor and CPU interface.
+		 * over the log just put in ramoops. XNU's loader_return left the other cores off, its shared interrupts
+		 * disabled, and the stub the MMU and caches off. What XNU quiets only with bootcpu= is done here: its
+		 * timer, the redistributors of the cores it had, and this core's CPU interface.
 		 */
-		const uint64_t sgi = 0x0c040000ULL + 0x10000;    /* core 0's SGI/PPI frame */
-
 		__asm__ volatile("msr cntv_ctl_el0, xzr; isb");
-		wr32(sgi + 0x180, 0xffffffffu);   /* GICR_ICENABLER0 */
-		wr32(sgi + 0x280, 0xffffffffu);   /* GICR_ICPENDR0 */
-		wr32(sgi + 0x380, 0xffffffffu);   /* GICR_ICACTIVER0 */
+		/*
+		 * The SGI/PPI frame of each core XNU was given (with cpus > 1 not only core 0's: the others are off,
+		 * but what XNU set up and left pending or active in their redistributors stays there for Linux to
+		 * start them into). The redistributors are found by their GICR_TYPER affinity, 0x20000 apart.
+		 */
+		for (int i = 0; i < XNU_CORES; i++) {
+			uint64_t rd = 0x0c040000ULL;
+			int found = 0;
+
+			for (int f = 0; f < 16; f++, rd += 0x20000) {
+				uint32_t typer_lo = rd32(rd + 0x08), aff = rd32(rd + 0x0c);
+
+				if (aff == (uint32_t)core_order[i] << 8) {
+					wr32(rd + 0x10000 + 0x180, 0xffffffffu);   /* GICR_ICENABLER0 */
+					wr32(rd + 0x10000 + 0x280, 0xffffffffu);   /* GICR_ICPENDR0 */
+					wr32(rd + 0x10000 + 0x380, 0xffffffffu);   /* GICR_ICACTIVER0 */
+					if (XNU_CORES > 1) {
+						out("core ");
+						out_dec(core_order[i]);
+						out("'s redistributor at ");
+						out_hex(rd);
+						out(" cleared\n");
+					}
+					found = 1;
+					break;
+				}
+				if (typer_lo & (1u << 4)) {     /* GICR_TYPER.Last */
+					break;
+				}
+			}
+			if (!found) {
+				out("core ");
+				out_dec(core_order[i]);
+				out("'s redistributor NOT FOUND by its affinity");
+				if (i == 0) {
+					/* the first frame, as before this looked them up: core 0's */
+					wr32(0x0c050000ULL + 0x180, 0xffffffffu);
+					wr32(0x0c050000ULL + 0x280, 0xffffffffu);
+					wr32(0x0c050000ULL + 0x380, 0xffffffffu);
+					out("; the first frame cleared");
+				}
+				out("\n");
+			}
+		}
 		__asm__ volatile("msr S3_0_C12_C12_7, xzr; isb");    /* ICC_IGRPEN1_EL1 */
+#if RETURN_CPUS
+		say_cpus();
+		{
+			extern void cpu_off_entry(void);
+			int64_t r;
+
+			out("CPU_ON core 1 ...\n");
+			r = psci_cpu_on(1u << 8, (uint64_t)(uintptr_t)cpu_off_entry, 0);
+			out("CPU_ON core 1 -> ");
+			out(r == 0 ? "0 (started)" : r == -4 ? "-4 (already on)" : r == -2 ? "-2 (invalid)" : "an error");
+			out("\n");
+			dbg_delay_ms(50);
+			say_cpus();
+		}
+		dbg_delay_ms(10000);
+#else
 		dbg_delay_ms(5000);
+#endif
 		chain_android();
 	}
 	dbg_delay_ms(20000);

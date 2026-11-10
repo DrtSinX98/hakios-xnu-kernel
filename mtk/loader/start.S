@@ -11,6 +11,7 @@
 .global psci_system_reset
 .global psci_cpu_on
 .global watcher_entry
+.global cpu_off_entry
 .global mmu_on
 .global dcache_clean_range
 .global irq_wait
@@ -206,6 +207,14 @@ psci_cpu_on:
     ldr     x0, =0xc4000003
     smc     #0
     ret
+
+/* A core started here (RETURN_CPUS's test of PSCI CPU_ON after XNU) switches itself straight off again. */
+cpu_off_entry:
+    msr     daifset, #0xf
+    ldr     x0, =0x84000002     /* PSCI CPU_OFF */
+    smc     #0
+1:  wfe
+    b       1b
 
 /* Second core, started by PSCI CPU_ON while XNU runs on the first: MMU and caches off. */
 watcher_entry:
