@@ -181,8 +181,19 @@ static void xnu_ufs_args(char *cl);
 #define XNU_ROOT_EMMC       1
 #endif
 #endif
+/* 1 (MT6781, with XNU_UFS): the same on the UFS -- the system image in xnusys, read by the kernel (mtkufs_root=1,
+ * mtk/mt6781/drivers/storage/hakios.mt6781_ufs.c); the payload's RAM disk stays md1. */
+#ifndef XNU_ROOT_UFS
+#define XNU_ROOT_UFS        0
+#endif
+#if XNU_ROOT_UFS && !(XNU_UFS && SOC_IS_MT6781)
+#error "XNU_ROOT_UFS needs XNU_UFS=1 on the MT6781 (the kernel takes xnusys's extent from it)"
+#endif
+#define XNU_ROOT_FLASH      (XNU_ROOT_EMMC || XNU_ROOT_UFS)
 #if XNU_ROOT_EMMC
 #define XNU_ROOT_ARG        "rd=md0 emmc_root=1"     /* (rd=md0 for libignition's "ramdisk" boot) */
+#elif XNU_ROOT_UFS
+#define XNU_ROOT_ARG        "rd=md0 mtkufs=1 mtkufs_root=1"
 #else
 #define XNU_ROOT_ARG        "rd=md0"
 #endif
@@ -937,7 +948,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 	} else if (rd_size != 0) {
 		uint64_t rd_reg[2] = { rd_pa, rd_size };
 		/* (with the system image on the eMMC the payload stays md1, where stage0 mounts it) */
-		dt_prop(&w, XNU_ROOT_EMMC ? "RAMDisk1" : "RAMDisk", rd_reg, sizeof(rd_reg));
+		dt_prop(&w, XNU_ROOT_FLASH ? "RAMDisk1" : "RAMDisk", rd_reg, sizeof(rd_reg));
 	}
 	dt_end(&w);
 	dt_end(&w);
@@ -2405,6 +2416,7 @@ static void __attribute__((noreturn)) run_xnu(void)
 	out("md0 ");
 	out_hex(sys_size ? sys_pa : rd_pa);
 	out(sys_size ? " (the system image), md1 " : XNU_ROOT_EMMC ? " is none: md1 (root.packfs), the system image on the eMMC" :
+	    XNU_ROOT_UFS ? " is none: md1 (root.apfs), the system image in xnusys on the UFS" :
 	    " (root.packfs only)");
 	if (sys_size) {
 		out_hex(rd_pa);
