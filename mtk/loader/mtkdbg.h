@@ -35,21 +35,39 @@
 #define TOPRGU_RESTART_KEY   0x1971u
 #define TOPRGU_SWRST_KEY     0x1209u
 
-/* LK's framebuffer (mblock "framebuffer"), the layer LK shows the logo on. */
+/* LK's framebuffer (mblock "framebuffer"), and the OVL0 layer LK shows it on. */
+#ifdef SOC_MT6781
+/* realme 8i: LK triple-buffers in its mblock, 0xa18000 apart, on layer 1 (mtkloader SOC_PROBE) */
+#define LK_FB_BASE           0x771b0000ULL
+#define LK_FB_SIZE           0x1e50000ULL
+#define LK_FB_PITCH          4320u      /* 1080 pixels, no padding */
+#define LK_FB_PITCH_MAX      8192u
+#define PANEL_W              1080u
+#define PANEL_H              2412u
+#define OVL_FB_LAYER         1
+#else
 #define LK_FB_BASE           0x787b0000ULL
 #define LK_FB_SIZE           0x1050000ULL
 #define LK_FB_PITCH          2944u      /* 736 pixels: LK aligns the width to 32 */
+#define LK_FB_PITCH_MAX      4096u
 #define PANEL_W              720u
 #define PANEL_H              1640u
+#define OVL_FB_LAYER         0
+#endif
 
 #define DISP_MUTEX_EN        0x14001020ULL
 #define DISP_MUTEX_RUN       0x14001024ULL
 
+#ifdef SOC_MT6781
+#define OVL0_BASE            0x14005000ULL
+#else
 #define OVL0_BASE            0x1400b000ULL
+#endif
 #define OVL_SRC_CON          0x02c      /* a bit per layer the hardware composes */
 #define OVL_L0_CON           0x030
 #define OVL_L0_PITCH         0x044
 #define OVL_L0_ADDR          0xf40
+#define OVL_FB(reg)          ((reg) + 0x20 * OVL_FB_LAYER)  /* an OVL_L0_* register of LK's layer */
 
 static inline uint32_t rd32(uint64_t a) { return *(volatile uint32_t *)a; }
 static inline void wr32(uint64_t a, uint32_t v) { *(volatile uint32_t *)a = v; }

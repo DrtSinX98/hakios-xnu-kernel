@@ -29,8 +29,16 @@
 
 /* XNU's view of memory: one contiguous range that nothing else (LK, Android, TEE, ATF, the
  * framebuffer) uses; 0xc0000000-0xfe000000 is free DRAM on this board. */
+#ifdef SOC_MT6781
+/* realme 8i (4 GB): the largest free range, up to dramc-rk0 at 0x13ffff000 (2 GB; DRAM ends at 0x140000000) */
+#define XNU_PHYS_BASE       0xc0000000ULL
+#define XNU_MEM_SIZE        0x7fffc000ULL
+#define DRAM_END_GB         5
+#else
 #define XNU_PHYS_BASE       0xc0000000ULL
 #define XNU_MEM_SIZE        0xfe000000ULL       /* up to dramc-rk1 at 0x1bffff000; room for the system image */
+#define DRAM_END_GB         8
+#endif
 /* Where the system image is put, clear of the kernel, as xnuloader does it (RESIDENT_RD_OFFSET). */
 #define SYSTEM_PA           (XNU_PHYS_BASE + 0x08000000ULL)
 #define SYSTEM_PART         "xnusys"
@@ -421,12 +429,12 @@ static uint32_t fb_pitch;
 /* LK's layer as OVL0 scans it, if it is where LK said; LK's values otherwise. */
 static void display_find(void)
 {
-	uint32_t addr = rd32(OVL0_BASE + OVL_L0_ADDR);
-	uint32_t pitch = rd32(OVL0_BASE + OVL_L0_PITCH) & 0xffff;
+	uint32_t addr = rd32(OVL0_BASE + OVL_FB(OVL_L0_ADDR));
+	uint32_t pitch = rd32(OVL0_BASE + OVL_FB(OVL_L0_PITCH)) & 0xffff;
 
 	fb_base = LK_FB_BASE;
 	fb_pitch = LK_FB_PITCH;
-	if (addr >= LK_FB_BASE && addr < LK_FB_BASE + LK_FB_SIZE && pitch >= PANEL_W * 4 && pitch <= 4096) {
+	if (addr >= LK_FB_BASE && addr < LK_FB_BASE + LK_FB_SIZE && pitch >= PANEL_W * 4 && pitch <= LK_FB_PITCH_MAX) {
 		fb_base = addr;
 		fb_pitch = pitch;
 	}
@@ -435,12 +443,12 @@ static void display_find(void)
 /* Opaque pixels only from here on: XNU's console writes alpha 0. */
 static void display_alpha_off(void)
 {
-	uint32_t con = rd32(OVL0_BASE + OVL_L0_CON);
-	wr32(OVL0_BASE + OVL_L0_CON, con & ~(1u << 8));
-	out("OVL0 L0_CON ");
+	uint32_t con = rd32(OVL0_BASE + OVL_FB(OVL_L0_CON));
+	wr32(OVL0_BASE + OVL_FB(OVL_L0_CON), con & ~(1u << 8));
+	out("OVL0 layer CON ");
 	out_hex(con);
 	out(" -> ");
-	out_hex(rd32(OVL0_BASE + OVL_L0_CON));
+	out_hex(rd32(OVL0_BASE + OVL_FB(OVL_L0_CON)));
 
 	/*
 	 * LK composes two layers: layer 0 is the picture, and layer 3 is its own overlay with the
@@ -449,7 +457,7 @@ static void display_alpha_off(void)
 	 * top of the home screen. Leave the overlay's layers out of what the hardware composes.
 	 */
 	uint32_t src = rd32(OVL0_BASE + OVL_SRC_CON);
-	wr32(OVL0_BASE + OVL_SRC_CON, src & 1u);
+	wr32(OVL0_BASE + OVL_SRC_CON, src & (1u << OVL_FB_LAYER));
 	wr32(DISP_MUTEX_EN, 1);
 	wr32(DISP_MUTEX_RUN, 1);
 	out(", SRC_CON ");
@@ -1768,7 +1776,7 @@ void watcher_main(void)
 		uint64_t pa = (uint64_t)i << 30;
 		if (i == 0) {
 			watcher_l1[i] = pa | (1u << 10) | (0u << 2) | 1;            /* MMIO: device */
-		} else if (i < 8) {
+		} else if (i < DRAM_END_GB) {
 			watcher_l1[i] = pa | (1u << 10) | (3u << 8) | (1u << 2) | 1; /* DRAM: normal WB, inner shareable */
 		} else {
 			watcher_l1[i] = 0;

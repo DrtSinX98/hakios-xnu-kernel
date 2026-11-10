@@ -13,6 +13,9 @@ if [ -z "${LLD:-}" ]; then
 fi
 [ -f "$ROOT/xnuloader/identity.h" ] || { echo "mtkloader: no xnuloader/identity.h -- xnuloader/mkidentity.sh makes it from your IPSW" >&2; exit 1; }
 CFLAGS="--target=aarch64-linux-gnu -ffreestanding -nostdlib -fno-builtin -mgeneral-regs-only -mstrict-align -Os -Wall -Wextra"
+# the SoC's addresses (mtkdbg.h, mtkloader.c): SOC_<CONFIG_SOC> from the tree's .config, if it has one
+SOC=$(sed -n 's/^CONFIG_SOC="\(.*\)"$/\1/p' "$ROOT/.config" 2>/dev/null | tr a-z A-Z)
+CFLAGS="$CFLAGS${SOC:+ -DSOC_$SOC}"
 
 # Two headers are made here and never kept in git (.gitignore):
 #  touchfw.h   the touch controller's firmware, out of YOUR phone's hdl_firmware.img (pull-firmware.sh puts it
