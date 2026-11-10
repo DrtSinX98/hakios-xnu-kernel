@@ -131,6 +131,15 @@ static void xnu_ufs_args(char *cl);
 #ifndef ILI_PROBE
 #define ILI_PROBE           0
 #endif
+/* 1 (MT6781): on the way to XNU, the touch controller's firmware sent (mtkili.h: reset released, ID read, download), so
+ * that the kernel's MT6781_ILI (touchscreen=3) finds it reporting. */
+#ifndef XNU_TOUCH_ILI
+#define XNU_TOUCH_ILI       0
+#endif
+#if XNU_TOUCH_ILI
+#define ILI_RELEASE_RST     1
+#define ILI_DOWNLOAD        1
+#endif
 /* 1: read the eMMC and report, then go back to Android (no XNU). */
 #ifndef MSDC_TEST
 #define MSDC_TEST           0
@@ -453,6 +462,9 @@ static void out_dec(uint64_t v)
 }
 
 #include "mtkconnsys.h"         /* Wi-Fi step 1: Android's device tree on CONNSYS, printed (uses out()) */
+#if (ILI_PROBE || XNU_TOUCH_ILI) && SOC_IS_MT6781
+#include "mtkili.h"             /* the realme 8i's touch controller (uses out()) */
+#endif
 
 /* ---- run state ---- */
 
@@ -2417,6 +2429,9 @@ static void __attribute__((noreturn)) run_xnu(void)
 #if XNU_UFS && SOC_IS_MT6781
 	xnu_ufs_args(ba->commandLine);
 #endif
+#if XNU_TOUCH_ILI && SOC_IS_MT6781
+	ili_xnu_args(ba->commandLine);
+#endif
 
 	out("md0 ");
 	out_hex(sys_size ? sys_pa : rd_pa);
@@ -2499,6 +2514,12 @@ static void __attribute__((noreturn)) run_xnu(void)
 		touch_bring_up();
 		big_cores_clock();
 	}
+#if XNU_TOUCH_ILI && SOC_IS_MT6781
+	if (ili_probe()) {
+		ili_download(0);
+		ili_bb_begin();         /* the pins stay GPIOs, chip select high, for the kernel (it reads by hand too) */
+	}
+#endif
 	/*
 	 * Nothing of ours is left on the panel: iOS paints only what it draws, and where it does not
 	 * reach, what LK wrote there stays -- its "Orange State: your device has been unlocked"
@@ -3964,10 +3985,6 @@ static void xnu_ufs_args(char *cl)
 }
 #endif
 
-#if ILI_PROBE && SOC_IS_MT6781
-#include "mtkili.h"
-#endif
-
 void mtkloader_main(uint64_t dtb)
 {
 #if PASS_THROUGH
@@ -4022,7 +4039,7 @@ void mtkloader_main(uint64_t dtb)
 		out("== mtkloader: ILI7807S touch probe ==\n");
 		if (ili_probe() && ILI_DOWNLOAD) {
 #if ILI_DOWNLOAD
-			ili_download();
+			ili_download(5000);
 #endif
 		}
 		out("ili: probe done\n");

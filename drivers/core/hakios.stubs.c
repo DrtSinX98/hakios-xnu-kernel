@@ -61,6 +61,10 @@ void hakios_mtk_keys_init(void) {}
 void hakios_mt6781_keys_init(void) {}
 #endif
 
+#ifndef HAKIOS_MT6781_ILI
+void hakios_mt6781_ili_init(void) {}
+#endif
+
 #ifndef HAKIOS_MALI
 void hakios_mali_init(void) {}
 bool hakios_mali_ready(void) { return false; }
