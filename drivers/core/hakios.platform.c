@@ -14,6 +14,7 @@
 #include <kern/locks.h>
 #include <kern/startup.h>
 #include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 
@@ -58,6 +59,46 @@ static char hakios_drivers_string[] = HAKIOS_DRIVERS_LIST;
 
 SYSCTL_STRING(_kern_hakios, OID_AUTO, drivers, CTLFLAG_RD | CTLFLAG_LOCKED, hakios_drivers_string, 0,
     "the drivers this kernel was built with (CONFIG_HAKIOS_* of its configuration, lowercase)");
+
+/*
+ * kern.hakios.say (boot-arg hakios_say=1): a line written here by any program goes into the kernel's log with its time
+ * (printf: the message buffer and the console), at most 255 bytes. For start-up steps of system programs that a run's
+ * console would lose (libhakios in backboardd); without the boot-arg a write is refused.
+ */
+static int
+sysctl_hakios_say SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	static int allowed = -1;
+	char line[256];
+	size_t n;
+	int error;
+
+	if (allowed < 0) {
+		int on = 0;
+
+		allowed = PE_parse_boot_argn("hakios_say", &on, sizeof(on)) && on;
+	}
+	if (req->newptr == USER_ADDR_NULL) {
+		return 0;
+	}
+	if (!allowed) {
+		return EPERM;
+	}
+	n = MIN(req->newlen, sizeof(line) - 1);
+	error = SYSCTL_IN(req, line, n);
+	if (error != 0) {
+		return error;
+	}
+	line[n] = 0;
+	while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == 0)) {
+		line[--n] = 0;
+	}
+	printf("%s\n", line);
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, say, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    sysctl_hakios_say, "A", "a line into the kernel's log (boot-arg hakios_say=1)");
 
 static void
 hakios_platform_init(void)
