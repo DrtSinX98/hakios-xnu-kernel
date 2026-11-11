@@ -1211,7 +1211,7 @@ static void save_c(struct save_at *s, char c)
 			dbg_puts("\n\n[... ");
 			dbg_dec(s->skip_to - s->head);
 			dbg_puts(XNU_LOG_KEEP ? " bytes of the XNU log left out here, but for lines with \"hakios: input\", \"backboardd[\", "
-			    "\"still waiting\" or \"SpringBoard[\" ...]\n\n" :
+			    "\"still waiting\", \"SpringBoard[\" or ps -A's ...]\n\n" :
 			    " bytes of the XNU log left out here ...]\n\n");
 		}
 		if (s->at < s->head || s->at >= s->skip_to || s->keep_line) {
@@ -1222,7 +1222,8 @@ static void save_c(struct save_at *s, char c)
 }
 
 #if XNU_LOG_KEEP
-static const char *const keep_words[] = { "hakios: input", "backboardd[", "still waiting", "SpringBoard[" };
+static const char *const keep_words[] = { "hakios: input", "backboardd[", "still waiting", "SpringBoard[", "PID TTY",
+	" ?? " };   /* the last two: ps -A */
 
 /* whether [from, to) has one of keep_words in it */
 static int keep_this(const volatile char *p, uint64_t from, uint64_t to)
