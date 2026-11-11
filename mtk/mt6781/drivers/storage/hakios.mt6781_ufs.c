@@ -35,6 +35,9 @@
  * kern.hakios.var_busy is the claim a writer must hold; kern.hakios.var_save the handshake with the saver, asked at
  * the end of a run (hakios_var_save_on_return). Every write is read back and compared before it is answered; the
  * cache is synchronized when the device is closed and before LK's list goes back.
+ *
+ * var_store_crash_at=N, a test only: right after the N-th write to /dev/rufs_darwin of this boot, before its read-back
+ * and with nothing synchronized, the phone is reset at once (PSCI SYSTEM_RESET): a save cut off as by a power loss.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -142,6 +145,8 @@ static bool write_on, darwin_ok;                /* mtkufs_write=1; darwin checke
 static uint64_t mufs_writes;
 static bool darwin_dirty;                       /* written since the cache was last synchronized */
 static uint8_t darwin_buf[BOUNCE];              /* /dev/rufs_darwin's data on its way, under mufs_lock */
+static uint32_t darwin_writes, crash_at;        /* this boot's writes to /dev/rufs_darwin; var_store_crash_at=N */
+extern uint32_t psci_smp_hvc;                   /* osfmk/arm64/psci_smp.c: the firmware is called with hvc, else smc */
 static uint64_t dev_blocks;                     /* what the device says it is: xnusys's APFS containers, else all of it */
 static bool apfs_found;
 static uint32_t cnr_in;
@@ -1054,6 +1059,9 @@ mufs_start(void)
 	printf("mtkufs: xnusys at LUN 2 block %llu, %llu blocks of 4096 (from mtkloader)\n", part_lba, part_blocks);
 	on = 0;
 	write_on = PE_parse_boot_argn("mtkufs_write", &on, sizeof(on)) && on != 0;
+	if (!PE_parse_boot_argn("var_store_crash_at", &crash_at, sizeof(crash_at))) {
+		crash_at = 0;
+	}
 	if (write_on && (!PE_parse_boot_argn("mtkufs_dlba", &dlba, sizeof(dlba)) ||
 	    !PE_parse_boot_argn("mtkufs_dblocks", &dblocks, sizeof(dblocks)))) {
 		dlba = dblocks = 0;
@@ -1299,6 +1307,17 @@ darwin_rw(struct uio *uio, bool writing)
 			if (error == 0) {
 				darwin_dirty = true;
 				error = write_abs(dlba + first, (uint32_t)blocks, darwin_buf, "/dev/rufs_darwin");
+			}
+			if (error == 0 && ++darwin_writes == crash_at) {
+				register uint64_t x0 __asm__("x0") = 0x84000009;        /* PSCI SYSTEM_RESET */
+
+				printf("mtkufs: var_store_crash_at=%u: write %u of /dev/rufs_darwin done (darwin blocks %llu..%llu): "
+				    "the phone is reset now\n", crash_at, darwin_writes, first, first + blocks - 1);
+				if (psci_smp_hvc) {
+					__asm__ volatile ("hvc #0" : "+r" (x0) : : "x1", "x2", "x3", "memory");
+				} else {
+					__asm__ volatile ("smc #0" : "+r" (x0) : : "x1", "x2", "x3", "memory");
+				}
 			}
 			if (error == 0) {
 				error = read_abs(dlba + first, (uint32_t)blocks, "/dev/rufs_darwin, read back");
