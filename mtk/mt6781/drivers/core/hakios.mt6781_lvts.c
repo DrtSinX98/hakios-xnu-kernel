@@ -12,6 +12,8 @@
  * thermal block's reset bit:
  *   1  the block reset (infracfg_ao +0x120/+0x124 bit 0, set then cleared; only that bit written); for each
  *      controller its clock on (+0xe4), its devices reset, their ID read back (+0x4c; expected 0x81 + controller)
+ *   2  each controller's devices set up: counting stopped, auto RCK, low-power single mode, its delay, a 20 us
+ *      counting window, the chopper and reserved settings (eleven device writes through +0x50, 3 us apart)
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -49,6 +51,21 @@ static vm_offset_t lvts, infra;
 static uint32_t every_s, golden;
 
 extern void IODelay(unsigned int microseconds);
+
+/* step 2's device writes: register, value */
+static const uint8_t dev_setup[][2] = {
+	{ 0x03, 0x00 },         /* counting stopped (RG_TSFM_ST = 0) */
+	{ 0x0e, 0x01 },         /* auto RCK */
+	{ 0x06, 0xb8 },         /* low-power single mode */
+	{ 0x07, 0xa6 },         /* RG_TSFM_LPDLY = 2 */
+	{ 0x05, 0x00 },         /* counting window: 20 us */
+	{ 0x04, 0x20 },
+	{ 0x0a, 0xac },         /* TSV2F_CHOP_CKSEL, TSV2F_EN */
+	{ 0x0c, 0xfc },         /* TSBG_DEM_CKSEL, TSBG_CHOP_EN */
+	{ 0x09, 0x8d },         /* TS_RSV */
+	{ 0x08, 0xf7 },         /* TS_CHOP control */
+	{ 0x0b, 0x04 },         /* TSV2F_RSV */
+};
 
 static void
 wr(vm_offset_t at, uint32_t v)
@@ -131,6 +148,23 @@ watch(__unused void *arg, __unused wait_result_t wr)
 	}
 }
 
+/* step 2: each controller's devices set up, in the order MediaTek's driver writes them */
+static void
+init_step2(void)
+{
+	for (uint32_t c = 0; c < 3; c++) {
+		vm_offset_t tc = lvts + 0x100 * c;
+
+		for (uint32_t i = 0; i < sizeof(dev_setup) / sizeof(dev_setup[0]); i++) {
+			wr(tc + LVTS_CONFIG, DEV_WRITE(dev_setup[i][0], dev_setup[i][1]));
+			IODelay(3);
+		}
+		printf("lvts init 2: controller %u: %zu device writes; LVTS_CONFIG %08x, ID %08x\n", c,
+		    sizeof(dev_setup) / sizeof(dev_setup[0]), *(volatile uint32_t *)(tc + LVTS_CONFIG),
+		    *(volatile uint32_t *)(tc + LVTS_ID));
+	}
+}
+
 void
 hakios_mt6781_lvts_init(void)
 {
@@ -150,6 +184,9 @@ hakios_mt6781_lvts_init(void)
 			printf("lvts init: the thermal controller's clock is gated: no bring-up\n");
 		} else {
 			init_step1();
+			if (step >= 2) {
+				init_step2();
+			}
 		}
 	}
 	if (every_s == 0) {

@@ -38,6 +38,14 @@
  *
  * var_store_crash_at=N, a test only: right after the N-th write to /dev/rufs_darwin of this boot, before its read-back
  * and with nothing synchronized, the phone is reset at once (PSCI SYSTEM_RESET): a save cut off as by a power loss.
+ *
+ * The data volume (boot-arg mtkufs_data=1 read only, 2 writable; with mtkufs_write=1): /dev/mtkufs_data, a block
+ * device over darwin past the store's two slots (DATA_FIRST) to its end, which init mounts on /private/var as HFS Plus
+ * (var_hfs=mtkufs_data). Every I/O is checked against that window here, so it never reaches the store or the boot
+ * settings block; the whitelist still stands under it. Its writes are not read back (mtkufs_readback=1: they are);
+ * DKIOCSYNCHRONIZE synchronizes the device's cache (HFS Plus's journal asks it); the end of a run syncs the file
+ * systems first (hakios_var_save_on_return). mtkufs_data_crash_at=N, a test only: the phone reset right after the
+ * N-th write to it, as var_store_crash_at.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -69,6 +77,8 @@ extern void loader_log_putc(char c);
 extern void IOSleep(unsigned int milliseconds);
 void hakios_mt6781_ufs_quiesce(void);
 void hakios_var_save_on_return(void);
+extern int sync_internal(void);                 /* bsd/vfs/vfs_syscalls.c: the file systems synced, within 5 s */
+static int data_sync(void);
 
 #define MUFS_PHYS           0x11270000ULL       /* ufshci@11270000, "mediatek,mt8183-ufshci" */
 #define MUFS_SIZE           0x1000
@@ -128,6 +138,8 @@ void hakios_var_save_on_return(void);
 #define GPT_ENTRY_BLOCKS    4                   /* 128 entries of 128 bytes */
 #define DARWIN_KEEP         256                 /* darwin's first MiB: the boot settings block, never written here */
 #define DARWIN_MINOR        1                   /* /dev/rufs_darwin; minor 0 is xnusys */
+#define DATA_MINOR          2                   /* /dev/mtkufs_data */
+#define DATA_FIRST          (DARWIN_KEEP + 2 * 524288)  /* past the store's two 2 GiB slots (var_store.c SLOT_BYTES) */
 
 struct mufs_cmd {
 	uint8_t upiu[32];
@@ -146,6 +158,9 @@ static uint64_t mufs_writes;
 static bool darwin_dirty;                       /* written since the cache was last synchronized */
 static uint8_t darwin_buf[BOUNCE];              /* /dev/rufs_darwin's data on its way, under mufs_lock */
 static uint32_t darwin_writes, crash_at;        /* this boot's writes to /dev/rufs_darwin; var_store_crash_at=N */
+static uint32_t data_mode, data_bsize = BLOCK;  /* mtkufs_data=: 1 read only, 2 writable; the volume's block size */
+static uint32_t data_writes, data_crash_at;     /* this boot's writes to /dev/mtkufs_data; mtkufs_data_crash_at=N */
+static bool data_readback, data_written;        /* mtkufs_readback=1; written this boot (synced at the end) */
 extern uint32_t psci_smp_hvc;                   /* osfmk/arm64/psci_smp.c: the firmware is called with hvc, else smc */
 static uint64_t dev_blocks;                     /* what the device says it is: xnusys's APFS containers, else all of it */
 static bool apfs_found;
@@ -1062,6 +1077,10 @@ mufs_start(void)
 	if (!PE_parse_boot_argn("var_store_crash_at", &crash_at, sizeof(crash_at))) {
 		crash_at = 0;
 	}
+	PE_parse_boot_argn("mtkufs_data", &data_mode, sizeof(data_mode));
+	PE_parse_boot_argn("mtkufs_data_crash_at", &data_crash_at, sizeof(data_crash_at));
+	on = 0;
+	data_readback = PE_parse_boot_argn("mtkufs_readback", &on, sizeof(on)) && on != 0;
 	if (write_on && (!PE_parse_boot_argn("mtkufs_dlba", &dlba, sizeof(dlba)) ||
 	    !PE_parse_boot_argn("mtkufs_dblocks", &dblocks, sizeof(dblocks)))) {
 		dlba = dblocks = 0;
@@ -1344,8 +1363,9 @@ darwin_rw(struct uio *uio, bool writing)
 }
 
 /*
- * The orderly end of a run (loader_return.c, and the restart hook): ask the saver for the data volume and wait, bounded,
- * while the system is still whole. Nothing if no saver registered.
+ * The orderly end of a run (loader_return.c, and the restart hook): if /dev/mtkufs_data was written, the file systems
+ * synced and its cache synchronized; then ask the saver for the data volume and wait, bounded, while the system is
+ * still whole. No saver registered: no wait.
  */
 void
 hakios_var_save_on_return(void)
@@ -1353,6 +1373,14 @@ hakios_var_save_on_return(void)
 	uint32_t ms = VAR_SAVE_MS;
 	uint64_t waited = 0;
 
+	if (data_written && !dead) {
+		int error;
+
+		(void)sync_internal();
+		error = data_sync();
+		printf("mtkufs: the run is ending: file systems synced, the data volume's cache synchronized (%d); %u writes "
+		    "to it this boot\n", error, data_writes);
+	}
 	if (!usable || !darwin_ok || var_save != VAR_SAVE_IDLE) {
 		return;
 	}
@@ -1370,6 +1398,172 @@ hakios_var_save_on_return(void)
 	}
 }
 
+/* ---- the data volume: darwin from DATA_FIRST to its end ---- */
+
+static uint64_t
+data_bytes(void)
+{
+	return data_mode != 0 && usable && darwin_ok && dblocks > DATA_FIRST ? (dblocks - DATA_FIRST) * BLOCK : 0;
+}
+
+static void
+data_crash(uint64_t first, uint64_t blocks)
+{
+	register uint64_t x0 __asm__("x0") = 0x84000009;        /* PSCI SYSTEM_RESET */
+
+	printf("mtkufs: mtkufs_data_crash_at=%u: write %u of /dev/mtkufs_data done (its blocks %llu..%llu): the phone is "
+	    "reset now\n", data_crash_at, data_writes, first, first + blocks - 1);
+	if (psci_smp_hvc) {
+		__asm__ volatile ("hvc #0" : "+r" (x0) : : "x1", "x2", "x3", "memory");
+	} else {
+		__asm__ volatile ("smc #0" : "+r" (x0) : : "x1", "x2", "x3", "memory");
+	}
+}
+
+/*
+ * Bytes [offset, offset + len) of the data volume, read into p or written from it, a bounce buffer's worth at a time;
+ * a write that is not whole blocks of 4096 has the blocks around it read and patched first.
+ */
+static int
+data_io(bool writing, uint64_t offset, uint8_t *p, uint64_t len)
+{
+	uint64_t size = data_bytes();
+	int error = 0;
+
+	if (size == 0 || dead) {
+		return ENXIO;
+	}
+	if (offset > size || len > size - offset) {
+		return EINVAL;
+	}
+	if (writing && data_mode < 2) {
+		return EROFS;
+	}
+	lck_mtx_lock(&mufs_lock);
+	while (len > 0 && error == 0) {
+		uint64_t first = offset / BLOCK, skip = offset % BLOCK, blocks = (skip + len + BLOCK - 1) / BLOCK, take;
+
+		if (blocks > BOUNCE / BLOCK) {
+			blocks = BOUNCE / BLOCK;
+		}
+		take = MIN(blocks * BLOCK - skip, len);
+		if (!writing) {
+			error = read_abs(dlba + DATA_FIRST + first, (uint32_t)blocks, "/dev/mtkufs_data");
+			if (error == 0) {
+				memcpy(p, mufs_bounce + skip, (size_t)take);
+				mufs_reads++;
+			}
+		} else {
+			if (skip != 0 || take != blocks * BLOCK) {
+				error = read_abs(dlba + DATA_FIRST + first, (uint32_t)blocks, "/dev/mtkufs_data, around a part");
+				if (error == 0) {
+					memcpy(darwin_buf, mufs_bounce, (size_t)blocks * BLOCK);
+				}
+			}
+			if (error == 0) {
+				memcpy(darwin_buf + skip, p, (size_t)take);
+				darwin_dirty = data_written = true;
+				error = write_abs(dlba + DATA_FIRST + first, (uint32_t)blocks, darwin_buf, "/dev/mtkufs_data");
+			}
+			if (error == 0 && ++data_writes == data_crash_at) {
+				data_crash(first, blocks);
+			}
+			if (error == 0 && data_readback) {
+				error = read_abs(dlba + DATA_FIRST + first, (uint32_t)blocks, "/dev/mtkufs_data, read back");
+				if (error == 0 && memcmp(mufs_bounce, darwin_buf, (size_t)blocks * BLOCK) != 0) {
+					printf("mtkufs: data volume blocks %llu..%llu read back differently from what was written\n",
+					    first, first + blocks - 1);
+					error = EIO;
+				}
+			}
+		}
+		if (error != 0) {
+			mufs_errors++;
+		}
+		offset += take;
+		p += take;
+		len -= take;
+	}
+	lck_mtx_unlock(&mufs_lock);
+	return error;
+}
+
+static void
+data_strategy(buf_t bp)
+{
+	uint64_t offset = (uint64_t)buf_blkno(bp) * data_bsize, len = buf_count(bp), size = data_bytes();
+	caddr_t mapped;
+	int error;
+
+	if (offset >= size) {
+		buf_seterror(bp, offset == size ? 0 : EINVAL);
+		buf_setresid(bp, buf_count(bp));
+		buf_biodone(bp);
+		return;
+	}
+	len = MIN(len, size - offset);
+	/* HFS Plus's cluster I/O hands over pages with no kernel address yet: buf_map() gives them one */
+	if ((error = buf_map(bp, &mapped)) == 0) {
+		error = data_io(!(buf_flags(bp) & B_READ), offset, (uint8_t *)mapped, len);
+		buf_unmap(bp);
+	}
+	buf_setresid(bp, (uint32_t)(buf_count(bp) - (error ? 0 : len)));
+	if (error) {
+		buf_seterror(bp, error);
+	}
+	buf_biodone(bp);
+}
+
+static int
+data_sync(void)
+{
+	int error = 0;
+
+	lck_mtx_lock(&mufs_lock);
+	if (darwin_dirty && !dead) {
+		error = mufs_sync();
+		if (error == 0) {
+			darwin_dirty = false;
+		}
+	}
+	lck_mtx_unlock(&mufs_lock);
+	return error;
+}
+
+static int
+data_ioctl(u_long cmd, caddr_t data)
+{
+	switch (cmd) {
+	case DKIOCGETBLOCKSIZE:
+		*(uint32_t *)data = data_bsize;
+		return 0;
+	case DKIOCSETBLOCKSIZE:
+		if (*(uint32_t *)data < SECTOR || *(uint32_t *)data > BLOCK || (*(uint32_t *)data & (*(uint32_t *)data - 1)) != 0) {
+			return EINVAL;
+		}
+		data_bsize = *(uint32_t *)data;
+		return 0;
+	case DKIOCGETPHYSICALBLOCKSIZE:
+		*(uint32_t *)data = BLOCK;
+		return 0;
+	case DKIOCGETBLOCKCOUNT:
+		*(uint64_t *)data = data_bytes() / data_bsize;
+		return 0;
+	case DKIOCISWRITABLE:
+		*(uint32_t *)data = data_mode >= 2;
+		return 0;
+	case DKIOCGETMAXBLOCKCOUNTREAD:
+	case DKIOCGETMAXBLOCKCOUNTWRITE:
+		*(uint64_t *)data = BOUNCE / data_bsize;
+		return 0;
+	case DKIOCSYNCHRONIZE:
+	case DKIOCSYNCHRONIZECACHE:
+		return data_sync();
+	default:
+		return ENOTTY;
+	}
+}
+
 /* ---- the devices ---- */
 
 static int
@@ -1377,6 +1571,9 @@ mufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
 {
 	if (minor(dev) == DARWIN_MINOR) {
 		return usable && darwin_ok && !dead ? 0 : ENXIO;
+	}
+	if (minor(dev) == DATA_MINOR) {
+		return data_bytes() == 0 || dead ? ENXIO : (flags & FWRITE) && data_mode < 2 ? EROFS : 0;
 	}
 	return (flags & FWRITE) ? EROFS : 0;
 }
@@ -1386,6 +1583,9 @@ mufs_close(dev_t dev, __unused int flags, __unused int devtype, __unused proc_t 
 {
 	int error = 0;
 
+	if (minor(dev) == DATA_MINOR) {
+		return data_sync();
+	}
 	if (minor(dev) == DARWIN_MINOR && darwin_dirty) {
 		lck_mtx_lock(&mufs_lock);
 		error = mufs_sync();
@@ -1404,6 +1604,10 @@ mufs_strategy(buf_t bp)
 	uint32_t count = buf_count(bp);
 	int error = 0;
 
+	if (minor(buf_device(bp)) == DATA_MINOR) {
+		data_strategy(bp);
+		return;
+	}
 	if (!(buf_flags(bp) & B_READ)) {
 		error = EROFS;                          /* this device never writes */
 	} else if (at >= sectors) {
@@ -1423,8 +1627,11 @@ mufs_strategy(buf_t bp)
 }
 
 static int
-mufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
+mufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
 {
+	if (minor(dev) == DATA_MINOR) {
+		return data_ioctl(cmd, data);
+	}
 	switch (cmd) {
 	case DKIOCGETBLOCKSIZE:
 		*(uint32_t *)data = SECTOR;
@@ -1446,9 +1653,9 @@ mufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __u
 }
 
 static int
-mufs_size(__unused dev_t dev)
+mufs_size(dev_t dev)
 {
-	return SECTOR;
+	return minor(dev) == DATA_MINOR ? (int)data_bsize : SECTOR;
 }
 
 static int
@@ -1540,6 +1747,28 @@ hakios_mt6781_ufs_init(void)
 	if (darwin_ok && devfs_make_node(makedev(cmajor, DARWIN_MINOR), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600,
 	    "rufs_darwin") == NULL) {
 		printf("mtkufs: no /dev/rufs_darwin\n");
+	}
+	if (data_bytes() != 0) {
+		if (devfs_make_node(makedev(bmajor, DATA_MINOR), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "mtkufs_data") ==
+		    NULL) {
+			printf("mtkufs: no /dev/mtkufs_data\n");
+		} else {
+			printf("mtkufs: /dev/mtkufs_data: darwin blocks %u..%llu, %llu blocks of 4096 (%llu MiB), %s%s\n",
+			    DATA_FIRST, dblocks - 1, dblocks - DATA_FIRST, (dblocks - DATA_FIRST) / 256,
+			    data_mode >= 2 ? "writable" : "read only (mtkufs_data=1)",
+			    data_mode >= 2 && data_readback ? ", every write read back" : "");
+			/* the volume headers' signatures (HFS Plus: "H+" or "HX" at 1024 and at its end - 1024), read once */
+			uint8_t head[8], tail[8];
+
+			if (data_io(false, 1024, head, 8) == 0 && data_io(false, data_bytes() - 1024, tail, 8) == 0) {
+				printf("mtkufs: /dev/mtkufs_data: at 1024 %02x%02x%02x%02x%02x%02x%02x%02x, at its end - 1024 "
+				    "%02x%02x%02x%02x%02x%02x%02x%02x\n", head[0], head[1], head[2], head[3], head[4], head[5],
+				    head[6], head[7], tail[0], tail[1], tail[2], tail[3], tail[4], tail[5], tail[6], tail[7]);
+			}
+		}
+	} else if (data_mode != 0) {
+		printf("mtkufs: mtkufs_data=%u, but no darwin past the store's slots (mtkufs_write=1 needed): no "
+		    "/dev/mtkufs_data\n", data_mode);
 	}
 }
 
