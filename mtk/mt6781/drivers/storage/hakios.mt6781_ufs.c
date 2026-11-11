@@ -29,6 +29,12 @@
  * xnusys's): WRITE(10) and READ(10) only inside the partition darwin past its first MiB (T26's), SYNCHRONIZE CACHE(10)
  * of all of it; nothing else ever written. mtkufs_wtest=1 is the dry run: one MiB of a known pattern at darwin + 1 MiB,
  * written, the cache synchronized, read back and compared, with the speed of each.
+ *
+ * The data volume's store (userland/src/var_store.c, the POCO's protocol): /dev/rufs_darwin, darwin past its first
+ * MiB counted in bytes from darwin's start; kern.hakios.var_store_at says where the store starts (1 MiB);
+ * kern.hakios.var_busy is the claim a writer must hold; kern.hakios.var_save the handshake with the saver, asked at
+ * the end of a run (hakios_var_save_on_return). Every write is read back and compared before it is answered; the
+ * cache is synchronized when the device is closed and before LK's list goes back.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -44,7 +50,10 @@
 #include <sys/errno.h>
 #include <sys/fcntl.h>
 #include <sys/hakios.input.h>
+#include <sys/proc.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <vm/vm_kern.h>
 #include <vm/memory_types.h>
 
@@ -54,7 +63,9 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 extern void loader_log_putc(char c);
+extern void IOSleep(unsigned int milliseconds);
 void hakios_mt6781_ufs_quiesce(void);
+void hakios_var_save_on_return(void);
 
 #define MUFS_PHYS           0x11270000ULL       /* ufshci@11270000, "mediatek,mt8183-ufshci" */
 #define MUFS_SIZE           0x1000
@@ -113,6 +124,7 @@ void hakios_mt6781_ufs_quiesce(void);
 #define GPT_ENTRIES         2
 #define GPT_ENTRY_BLOCKS    4                   /* 128 entries of 128 bytes */
 #define DARWIN_KEEP         256                 /* darwin's first MiB: T26's configuration, never written here */
+#define DARWIN_MINOR        1                   /* /dev/rufs_darwin; minor 0 is xnusys */
 
 struct mufs_cmd {
 	uint8_t upiu[32];
@@ -128,6 +140,8 @@ static uint64_t part_lba, part_blocks, lk_utrl; /* from mtkloader */
 static uint64_t dlba, dblocks;                  /* darwin, from mtkloader; used only with mtkufs_write=1 and the GPT's word */
 static bool write_on, darwin_ok;                /* mtkufs_write=1; darwin checked against the GPT */
 static uint64_t mufs_writes;
+static bool darwin_dirty;                       /* written since the cache was last synchronized */
+static uint8_t darwin_buf[BOUNCE];              /* /dev/rufs_darwin's data on its way, under mufs_lock */
 static uint64_t dev_blocks;                     /* what the device says it is: xnusys's APFS containers, else all of it */
 static bool apfs_found;
 static uint32_t cnr_in;
@@ -1157,18 +1171,211 @@ mufs_start(void)
 	return 0;
 }
 
+/* ---- the data volume's store: the POCO's handshake and claim (drivers/storage/hakios.ufs.c), for var_store.c ---- */
+
+#define VAR_SAVE_NONE      0
+#define VAR_SAVE_IDLE      1
+#define VAR_SAVE_WANTED    2
+#define VAR_SAVE_DONE      3
+#define VAR_SAVE_MS        20000        /* at most this long on the way out (var_save_ms=N) */
+
+static volatile int var_save = VAR_SAVE_NONE;
+static int var_busy_pid;
+static uint64_t var_store_at = DARWIN_KEEP * (uint64_t)BLOCK;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, var_store_at, CTLFLAG_RD | CTLFLAG_LOCKED, &var_store_at,
+    "where in darwin the data volume's store starts, in bytes (past T26's MiB)");
+
+/* 1 registers the saver, 3 says the volume is in the flash; 2 is the kernel's */
+static int
+sysctl_var_save(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = var_save, error = sysctl_io_number(req, value, sizeof(value), &value, NULL);
+
+	if (error != 0 || req->newptr == 0) {
+		return error;
+	}
+	if (value == VAR_SAVE_IDLE && var_save != VAR_SAVE_WANTED) {
+		var_save = VAR_SAVE_IDLE;
+	} else if (value == VAR_SAVE_DONE && var_save == VAR_SAVE_WANTED) {
+		var_save = VAR_SAVE_DONE;
+	} else if (value == VAR_SAVE_NONE) {
+		var_save = VAR_SAVE_NONE;
+	} else {
+		return EINVAL;
+	}
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, var_save, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_var_save, "I",
+    "the data volume's saver: 1 registers, 2 is the kernel asking, 3 is done");
+
+/* 1 takes the claim (from a holder that is gone, too), 0 gives it back; reading says who holds it */
+static int
+sysctl_var_busy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = var_busy_pid, me = proc_selfpid(), error = sysctl_io_number(req, value, sizeof(value), &value, NULL);
+
+	if (error != 0 || req->newptr == 0) {
+		return error;
+	}
+	lck_mtx_lock(&mufs_lock);
+	if (value == 1) {
+		if (var_busy_pid != 0 && var_busy_pid != me) {
+			proc_t held = proc_find(var_busy_pid);
+
+			if (held != NULL) {
+				proc_rele(held);
+				error = EBUSY;
+			} else {
+				printf("var_store: the claim on the store was left by process %d, which is gone\n", var_busy_pid);
+			}
+		}
+		if (error == 0) {
+			var_busy_pid = me;
+		}
+	} else if (value == 0) {
+		if (var_busy_pid == me || var_busy_pid == 0) {
+			var_busy_pid = 0;
+		} else {
+			error = EPERM;
+		}
+	} else {
+		error = EINVAL;
+	}
+	lck_mtx_unlock(&mufs_lock);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, var_busy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_var_busy, "I",
+    "the claim a writer of /dev/rufs_darwin must hold: 1 takes it, 0 gives it back");
+
+/*
+ * /dev/rufs_darwin: bytes of darwin from its start, readable and writable past its first MiB only. Writes in whole
+ * blocks, by the claim's holder, each piece read back and compared before the next.
+ */
+static int
+darwin_rw(struct uio *uio, bool writing)
+{
+	uint64_t window = DARWIN_KEEP * (uint64_t)BLOCK, end = dblocks * (uint64_t)BLOCK;
+	int error = 0;
+
+	if (!usable || dead || !darwin_ok) {
+		return ENXIO;
+	}
+	if (writing && (var_busy_pid == 0 || var_busy_pid != proc_selfpid())) {
+		mufs_refused++;
+		printf("mtkufs: a write to /dev/rufs_darwin by process %d without the claim (kern.hakios.var_busy): refused\n",
+		    proc_selfpid());
+		return EPERM;
+	}
+	while (error == 0 && uio_resid(uio) > 0) {
+		uint64_t off = (uint64_t)uio_offset(uio), len = (uint64_t)uio_resid(uio), first, skip, blocks, take;
+
+		if (off == end && !writing) {
+			break;                          /* the end: nothing more to read */
+		}
+		if (off < window || off >= end) {
+			return writing ? EPERM : EINVAL;
+		}
+		if (len > end - off) {
+			len = end - off;
+		}
+		if (writing && (off % BLOCK != 0 || len % BLOCK != 0)) {
+			return EINVAL;
+		}
+		first = off / BLOCK;
+		skip = off % BLOCK;
+		blocks = (skip + len + BLOCK - 1) / BLOCK;
+		if (blocks > BOUNCE / BLOCK) {
+			blocks = BOUNCE / BLOCK;
+		}
+		take = blocks * BLOCK - skip;
+		if (take > len) {
+			take = len;
+		}
+		lck_mtx_lock(&mufs_lock);
+		if (writing) {
+			error = uiomove((caddr_t)darwin_buf, (int)take, uio);
+			if (error == 0) {
+				darwin_dirty = true;
+				error = write_abs(dlba + first, (uint32_t)blocks, darwin_buf, "/dev/rufs_darwin");
+			}
+			if (error == 0) {
+				error = read_abs(dlba + first, (uint32_t)blocks, "/dev/rufs_darwin, read back");
+			}
+			if (error == 0 && memcmp(mufs_bounce, darwin_buf, (size_t)take) != 0) {
+				printf("mtkufs: darwin blocks %llu..%llu read back differently from what was written\n", first,
+				    first + blocks - 1);
+				error = EIO;
+			}
+		} else {
+			error = read_abs(dlba + first, (uint32_t)blocks, "/dev/rufs_darwin");
+			if (error == 0) {
+				mufs_reads++;
+				memcpy(darwin_buf, mufs_bounce + skip, (size_t)take);
+				error = uiomove((caddr_t)darwin_buf, (int)take, uio);
+			}
+		}
+		if (error != 0) {
+			mufs_errors++;
+		}
+		lck_mtx_unlock(&mufs_lock);
+	}
+	return error;
+}
+
+/*
+ * The orderly end of a run (loader_return.c, and the restart hook): ask the saver for the data volume and wait, bounded,
+ * while the system is still whole. Nothing if no saver registered.
+ */
+void
+hakios_var_save_on_return(void)
+{
+	uint32_t ms = VAR_SAVE_MS;
+	uint64_t waited = 0;
+
+	if (!usable || !darwin_ok || var_save != VAR_SAVE_IDLE) {
+		return;
+	}
+	PE_parse_boot_argn("var_save_ms", &ms, sizeof(ms));
+	printf("var_store: the run is ending: the data volume is asked for\n");
+	var_save = VAR_SAVE_WANTED;
+	while (var_save != VAR_SAVE_DONE && waited < ms) {
+		IOSleep(20);
+		waited += 20;
+	}
+	if (var_save == VAR_SAVE_DONE) {
+		printf("var_store: the saver has finished after %llu ms\n", waited);
+	} else {
+		printf("var_store: the saver did not answer in %u ms: the store keeps what it had\n", ms);
+	}
+}
+
 /* ---- the devices ---- */
 
 static int
-mufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused proc_t p)
+mufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
 {
+	if (minor(dev) == DARWIN_MINOR) {
+		return usable && darwin_ok && !dead ? 0 : ENXIO;
+	}
 	return (flags & FWRITE) ? EROFS : 0;
 }
 
 static int
-mufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
+mufs_close(dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
 {
-	return 0;
+	int error = 0;
+
+	if (minor(dev) == DARWIN_MINOR && darwin_dirty) {
+		lck_mtx_lock(&mufs_lock);
+		error = mufs_sync();
+		if (error == 0) {
+			darwin_dirty = false;
+		}
+		lck_mtx_unlock(&mufs_lock);
+	}
+	return error;
 }
 
 static void
@@ -1228,7 +1435,16 @@ mufs_size(__unused dev_t dev)
 static int
 mufs_rawread(dev_t dev, struct uio *uio, __unused int ioflag)
 {
+	if (minor(dev) == DARWIN_MINOR) {
+		return darwin_rw(uio, false);
+	}
 	return physio(mufs_strategy, NULL, dev, B_READ, (u_int (*)(buf_t))mufs_size, uio, SECTOR);
+}
+
+static int
+mufs_rawwrite(dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	return minor(dev) == DARWIN_MINOR ? darwin_rw(uio, true) : EROFS;
 }
 
 static const struct bdevsw mufs_bdevsw = {
@@ -1245,7 +1461,7 @@ static const struct cdevsw mufs_cdevsw = {
 	.d_open       = mufs_open,
 	.d_close      = mufs_close,
 	.d_read       = mufs_rawread,
-	.d_write      = eno_rdwrt,
+	.d_write      = mufs_rawwrite,
 	.d_ioctl      = mufs_ioctl,
 	.d_stop       = eno_stop,
 	.d_reset      = eno_reset,
@@ -1302,6 +1518,10 @@ hakios_mt6781_ufs_init(void)
 	    devfs_make_node(makedev(cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rmtkufs0") == NULL) {
 		printf("mtkufs: no /dev nodes\n");
 	}
+	if (darwin_ok && devfs_make_node(makedev(cmajor, DARWIN_MINOR), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600,
+	    "rufs_darwin") == NULL) {
+		printf("mtkufs: no /dev/rufs_darwin\n");
+	}
 }
 
 /*
@@ -1320,6 +1540,9 @@ hakios_mt6781_ufs_quiesce(void)
 			    mufs_reads, mufs_writes, mufs_errors, mufs_refused);
 		}
 		return;
+	}
+	if (darwin_dirty && !dead) {
+		(void)mufs_sync();              /* what was written out of the device's cache before LK has it */
 	}
 	ok = mufs_put_back(&left, &cnr);
 	say_late("mtkufs: at the end: transfer list %s LK's %llx (doorbell on entry %08x, completion bits of this kernel's "

@@ -110,6 +110,9 @@ void hakios_ufs_init(void) {}
 void hakios_ufs_report(__unused const char *when) {}
 bool hakios_ufs_dev(__unused dev_t dev) { return false; }
 void hakios_ufs_quiesce(void) {}
+#endif
+
+#if !defined(HAKIOS_UFS) && !defined(HAKIOS_MT6781_UFS)
 void hakios_var_save_on_return(void) {}         /* no flash, so no data volume to save into it */
 #endif
 
