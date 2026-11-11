@@ -89,8 +89,8 @@
 #endif
 /* 1 (MT6781, with XNU_PARK's device-tree helpers): before XNU, the CPU clocks as they are -- each cluster's PLL and
  * divider, the operating-point tables in LK's device tree (dvfsp@0011bc00), and the start of the CPU DVFS SRAM shared
- * with SSPM ("CSRAM"); and, before XNU and again at the hand-back, what of SSPM changes meanwhile (sspm_watch). Only
- * read. */
+ * with SSPM ("CSRAM"), LK's tables checked against it (table_check); and, before XNU and again at the hand-back, what
+ * of SSPM changes meanwhile (sspm_watch) and the CPU temperature (lvts_show; lvts_golden= for the kernel). Only read. */
 #ifndef DVFS_PROBE
 #define DVFS_PROBE          0
 #endif
@@ -1971,6 +1971,56 @@ static int say_parked(void)
 /* ---- the CPU clocks, only read (addresses and layout as MediaTek's MT6781 cpufreq driver has them) ---- */
 #define DVFS_CSRAM          0x0011bc00ULL       /* 5 KB SRAM: tables at +0x10, current OPP at +0x354, requests at +0x37c */
 
+/*
+ * LK's table (rows of MHz, voltage step, post divider, clock divider) against the one Android left in the CSRAM, as
+ * MediaTek's cpuhvfs_pvt_tbl_create lays it out: 16 words of voltage step << 16 | MHz, then 16 of clock divider << 16 |
+ * post divider. MHz and dividers must agree; the voltages differ where EEM lowered them, so they are only shown.
+ */
+static void table_check(const char *name, uint64_t data, uint32_t words, uint32_t csram)
+{
+	uint32_t rows = words / 4, same = 0;
+
+	for (uint32_t r = 0; r < rows && r < 16; r++) {
+		uint32_t mhz = fdt_get(data + 16 * r), post = fdt_get(data + 16 * r + 8), clk = fdt_get(data + 16 * r + 12);
+		uint32_t f = rd32(DVFS_CSRAM + csram + 4 * r), d = rd32(DVFS_CSRAM + csram + 4 * (16 + r));
+
+		if ((f & 0xffff) == mhz && d == ((clk & 0xff) << 16 | (post & 0xff))) {
+			same++;
+			continue;
+		}
+		out("dvfs: ");
+		out(name);
+		out(" row ");
+		out_dec(r);
+		out(" differs: LK ");
+		out_dec(mhz);
+		out(" MHz, dividers ");
+		out_dec(post);
+		out("/");
+		out_dec(clk);
+		out("; CSRAM ");
+		out_hex(f);
+		out(" ");
+		out_hex(d);
+		out("\n");
+	}
+	out("dvfs: ");
+	out(name);
+	out(" and the CSRAM's: ");
+	out_dec(same);
+	out(" of ");
+	out_dec(rows);
+	out(rows == 16 && same == 16 ? " rows agree (MHz, dividers)" : " rows agree (MHz, dividers): NOT the same table");
+	out("; voltage steps LK/CSRAM:");
+	for (uint32_t r = 0; r < rows && r < 16; r++) {
+		out(" ");
+		out_dec(fdt_get(data + 16 * r + 4));
+		out("/");
+		out_dec((rd32(DVFS_CSRAM + csram + 4 * r) >> 16) & 0xfff);
+	}
+	out("\n");
+}
+
 static void dvfs_probe(uint64_t dtb)
 {
 	static const struct {
@@ -1982,6 +2032,7 @@ static void dvfs_probe(uint64_t dtb)
 		{ "CCI (CCIPLL)", 0x1000c2a4, 0x0c53a2e0 },
 	};
 	static const char *const tables[] = { "L-table", "B-table", "CCI-table", "change_flag" };
+	static const uint32_t csram_at[] = { 0x10, 0xa0, 0x130 };       /* the A55s', the A76s', the CCI's */
 
 	for (int i = 0; i < 3; i++) {
 		uint32_t con1 = rd32(pll[i].con1), div = rd32(pll[i].div), post = (con1 >> 24) & 7, ckdiv = (div >> 17) & 0x1f;
@@ -2048,6 +2099,9 @@ static void dvfs_probe(uint64_t dtb)
 					out_dec(fdt_get(dtb + at + 8 + 4 * w));
 				}
 				out("\n");
+				if (t < 3) {
+					table_check(tables[t], dtb + at + 8, len / 4, csram_at[t]);
+				}
 			}
 			at += 8 + ((len + 3) & ~3u);
 		} else if (tok != FDT_NOP) {
@@ -2132,6 +2186,165 @@ static void sspm_watch(const char *when)
 		out_hex(rd32(DVFS_CSRAM + o));
 	}
 	out("\n");
+}
+
+/*
+ * The CPU temperature, only read, as MediaTek's thermal driver reads it: nine LVTS sensors on three controllers
+ * (0x1100b000: the A55s' three and the camera's; +0x100: the A76s' two; +0x200: the modem's and the GPU's two), each
+ * result at +0x90 + 4 * n (bits 15..0; bit 16 valid), in m°C (-204650 * raw >> 14) + golden * 500 + 204650. golden is
+ * the low byte of the chip's efuse word 112, which LK gives Linux in /chosen "atag,devinfo" (a count, then the words
+ * get_devinfo_with_index() reads). They count only once SSPM runs them (Linux asks it to); otherwise they read 0 or
+ * stand still. Their clock is infra_therm (infracfg_ao +0x90 bit 10 set: gated); while it is off they are not read.
+ * lvts_args passes golden to the kernel's reader (hakios.mt6781_lvts.c).
+ */
+#define LVTS_BASE           0x1100b000ULL
+#define INFRA_CG0_STA       0x10001090ULL
+#define INFRA_THERM_CG      (1u << 10)
+
+static uint32_t lvts_golden;                    /* 0: not known */
+
+/* where a property of a node just below the root of LK's tree is, or 0 */
+static uint64_t lk_prop(uint64_t dtb, const char *node, const char *prop, uint32_t *len)
+{
+	uint64_t at = fdt_get(dtb + 8), end = at + fdt_get(dtb + 36), str = dtb + fdt_get(dtb + 12), nn = 0, pn = 0;
+	int depth = 0, inside = 0;
+
+	while (node[nn]) {
+		nn++;
+	}
+	while (prop[pn]) {
+		pn++;
+	}
+	while (fdt_get(dtb) == 0xd00dfeedu && at < end) {
+		uint32_t tok = fdt_get(dtb + at);
+
+		at += 4;
+		if (tok == FDT_BEGIN_NODE) {
+			uint64_t n = 0;
+
+			while (((const volatile char *)dtb)[at + n]) {
+				n++;
+			}
+			depth++;
+			if (depth == 2 && n == nn && memcmp_n((const volatile char *)dtb + at, node, n) == 0) {
+				inside = 1;
+			}
+			at += (n + 1 + 3) & ~3ULL;
+		} else if (tok == FDT_END_NODE) {
+			if (inside && depth == 2) {
+				return 0;
+			}
+			depth--;
+		} else if (tok == FDT_PROP) {
+			uint32_t l = fdt_get(dtb + at), nameoff = fdt_get(dtb + at + 4);
+
+			if (inside && depth == 2 && memcmp_n((const volatile char *)str + nameoff, prop, pn + 1) == 0) {
+				*len = l;
+				return dtb + at + 8;
+			}
+			at += 8 + ((l + 3) & ~3u);
+		} else if (tok != FDT_NOP) {
+			break;
+		}
+	}
+	return 0;
+}
+
+/* " lvts_golden=<n>" onto the kernel's command line, and the chip's speed bin (efuse word 7) said; the devinfo
+ * words are LK's memory as it is (little-endian), not the tree's big-endian cells */
+static void lvts_args(char *cl)
+{
+	uint32_t len = 0;
+	uint64_t info = lk_prop(lk_dtb, "chosen", "atag,devinfo", &len);
+	char *at = cl;
+
+	if (info == 0 || len < 4 * 114) {
+		out("lvts: no atag,devinfo in LK's tree (or too short): no golden value, no lvts_golden\n");
+		return;
+	}
+	out("lvts: LK's devinfo: ");
+	out_dec(rd32(info));
+	out(" words; word 7 (speed bin) ");
+	out_hex(rd32(info + 4 * 8));
+	out(", segment ");
+	out_dec(rd32(info + 4 * 8) & 0xf);
+	out("; word 112 ");
+	out_hex(rd32(info + 4 * 113));
+	lvts_golden = rd32(info + 4 * 113) & 0xff;
+	out(", golden ");
+	out_dec(lvts_golden);
+	out("\n");
+	if (lvts_golden == 0) {
+		return;
+	}
+	while (*at) {
+		at++;
+	}
+	if ((uint32_t)(at - cl) + 20 >= BOOT_LINE_LENGTH) {
+		out("lvts: no room on the command line; no lvts_golden\n");
+		return;
+	}
+	for (const char *s = " lvts_golden="; *s; s++) {
+		*at++ = *s;
+	}
+	if (lvts_golden >= 100) {
+		*at++ = (char)('0' + lvts_golden / 100);
+	}
+	if (lvts_golden >= 10) {
+		*at++ = (char)('0' + lvts_golden / 10 % 10);
+	}
+	*at++ = (char)('0' + lvts_golden % 10);
+	*at = 0;
+}
+
+static void lvts_show(const char *when)
+{
+	static const char *const what[3] = { "A55s x3, camera", "A76s x2", "modem, GPU x2" };
+	static const uint32_t sensors[3] = { 4, 2, 3 };
+
+	if (rd32(INFRA_CG0_STA) & INFRA_THERM_CG) {
+		out("lvts (");
+		out(when);
+		out("): the thermal controller's clock is gated (infracfg_ao +0x90 ");
+		out_hex(rd32(INFRA_CG0_STA));
+		out("): not read\n");
+		return;
+	}
+	for (uint32_t c = 0; c < 3; c++) {
+		uint64_t base = LVTS_BASE + 0x100 * c;
+
+		out("lvts (");
+		out(when);
+		out("): ");
+		out(what[c]);
+		out(": MONCTL0 ");
+		out_hex(rd32(base));
+		out(", CONFIG ");
+		out_hex(rd32(base + 0x50));
+		for (uint32_t n = 0; n < sensors[c]; n++) {
+			uint32_t raw = rd32(base + 0x90 + 4 * n);
+			int64_t mc = ((-204650LL * (raw & 0xffff)) >> 14) + 500LL * lvts_golden + 204650;
+
+			out(n ? "; " : ": ");
+			out_hex(raw);
+			if ((raw & 0xffff) == 0 || lvts_golden == 0) {
+				continue;
+			}
+			out(" = ");
+			if (mc < 0) {
+				out("-");
+				mc = -mc;
+			}
+			out_dec((uint64_t)mc / 1000);
+			out_putc('.');
+			out_dec((uint64_t)mc % 1000 / 100);
+			out(" C");
+			if (!(raw & 0x10000)) {
+				out(" (not valid)");
+			}
+		}
+		out("\n");
+	}
 }
 
 #if SSPM_QUERY
@@ -2356,6 +2569,7 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 	save_host_keep(&xsyms);
 	show_log_tail(40);
 #if DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
+	lvts_show("at the hand-back");
 	sspm_watch("at the hand-back");
 #endif
 	if (SOC_IS_MT6781) {
@@ -3300,6 +3514,9 @@ static void __attribute__((noreturn)) run_xnu(void)
 #if XNU_PARK && SOC_IS_MT6781
 	xnu_park_setup(ba->commandLine);
 #endif
+#if DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
+	lvts_args(ba->commandLine);
+#endif
 
 	out("md0 ");
 	out_hex(sys_size ? sys_pa : rd_pa);
@@ -3367,6 +3584,7 @@ static void __attribute__((noreturn)) run_xnu(void)
 	}
 #if DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
 	dvfs_probe(lk_dtb);
+	lvts_show("before XNU");
 	sspm_watch("before XNU");
 #if SSPM_QUERY
 	sspm_query();

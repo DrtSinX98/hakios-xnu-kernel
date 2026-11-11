@@ -1,0 +1,165 @@
+/*
+ * The MT6781's CPU temperature: boot-arg lvts_watch=N says every N s the nine LVTS sensors as MediaTek's
+ * thermal driver reads them (three controllers at 0x1100b000, +0x100, +0x200; each result at +0x90 + 4 * n, bits 15..0,
+ * bit 16 valid), in °C with the chip's golden value, which mtkloader (DVFS_PROBE=1) passes as lvts_golden=:
+ *   lvts: 35 s: A55 41.2 41.0 41.5 cam 40.1 | A76 43.0 43.2 | md 39.0 gpu 39.1 39.0 | max 43.2 | 9 of 9 valid
+ * A sensor reading 0 shows "-"; without lvts_golden the raw values are shown. They count only once SSPM runs them
+ * (Linux asks it to): readings that never change mean they do not. While their clock (infra_therm: infracfg_ao +0x90
+ * bit 10 set) is gated they are not read.
+ *
+ * Nothing brings LVTS up under XNU (Linux's thermal driver does it, not SSPM), so boot-arg lvts_init=N takes its
+ * bring-up in numbered steps, in the order MediaTek's driver has it; writes only to the thermal controllers and the
+ * thermal block's reset bit:
+ *   1  the block reset (infracfg_ao +0x120/+0x124 bit 0, set then cleared; only that bit written); for each
+ *      controller its clock on (+0xe4), its devices reset, their ID read back (+0x4c; expected 0x81 + controller)
+ */
+#include <kern/clock.h>
+#include <kern/thread.h>
+#include <mach/mach_types.h>
+#include <pexpert/pexpert.h>
+#include <sys/hakios.input.h>
+#include <sys/systm.h>
+
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern void IOSleep(unsigned int milliseconds);
+
+#define LVTS_PHYS           0x1100b000ULL
+#define INFRA_PHYS          0x10001000ULL
+#define INFRA_CG0_STA       0x90
+#define INFRA_THERM_CG      (1u << 10)
+#define INFRA_RST0_SET      0x120
+#define INFRA_RST0_CLR      0x124
+#define INFRA_RST0_THERM    (1u << 0)
+#define LVTS_ID             0x4c
+#define LVTS_CONFIG         0x50                /* a write here is a write to the controller's sensor devices */
+#define LVTS_CLKEN          0xe4
+#define DEV_WRITE(reg, v)   (0xc1030000u | (reg) << 8 | (v))
+#define DEV_READ_ID         0xc502fc55u         /* the devices' ID read back into LVTS_ID */
+
+static const struct {
+	const char *name;
+	uint32_t at;
+} sensor[9] = {
+	{ " A55", 0x090 }, { "", 0x094 }, { "", 0x098 }, { " cam", 0x09c },
+	{ " | A76", 0x190 }, { "", 0x194 },
+	{ " | md", 0x290 }, { " gpu", 0x294 }, { "", 0x298 },
+};
+
+static vm_offset_t lvts, infra;
+static uint32_t every_s, golden;
+
+extern void IODelay(unsigned int microseconds);
+
+static void
+wr(vm_offset_t at, uint32_t v)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)at = v;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* step 1: the block reset, then each controller's clock on, its devices reset, their ID read back */
+static void
+init_step1(void)
+{
+	printf("lvts init 1: infracfg_ao reset 0 set/clear read %08x/%08x, clock gates %08x\n",
+	    *(volatile uint32_t *)(infra + INFRA_RST0_SET), *(volatile uint32_t *)(infra + INFRA_RST0_CLR),
+	    *(volatile uint32_t *)(infra + INFRA_CG0_STA));
+	wr(infra + INFRA_RST0_SET, INFRA_RST0_THERM);
+	IODelay(10);
+	wr(infra + INFRA_RST0_CLR, INFRA_RST0_THERM);
+	IODelay(10);
+	for (uint32_t c = 0; c < 3; c++) {
+		vm_offset_t tc = lvts + 0x100 * c;
+		uint32_t id;
+
+		wr(tc + LVTS_CLKEN, 1);
+		wr(tc + LVTS_CONFIG, DEV_WRITE(0xff, 0xff));
+		IODelay(100);
+		wr(tc + LVTS_CONFIG, DEV_READ_ID);
+		IODelay(3);
+		id = *(volatile uint32_t *)(tc + LVTS_ID);
+		printf("lvts init 1: controller %u: clock %08x, ID %08x (%s 0x%x)\n", c, *(volatile uint32_t *)(tc + LVTS_CLKEN),
+		    id, (id & 0xff) == 0x81 + c ? "as expected:" : "NOT the expected", 0x81 + c);
+	}
+}
+
+/* " <name> <°C, one decimal>" at line + at */
+static int
+put_c(char *line, int at, int size, const char *name, int mc)
+{
+	int d = (mc < 0 ? -mc : mc) / 100;
+
+	return snprintf(line + at, size - at, "%s %s%d.%d", name, mc < 0 ? "-" : "", d / 10, d % 10);
+}
+
+static void
+watch(__unused void *arg, __unused wait_result_t wr)
+{
+	for (;;) {
+		char line[256];
+		int at, max = 0, any = 0, valid = 0;
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		at = snprintf(line, sizeof(line), "lvts: %llu s:", ns / NSEC_PER_SEC);
+		if (*(volatile uint32_t *)(infra + INFRA_CG0_STA) & INFRA_THERM_CG) {
+			printf("%s the thermal controller's clock is gated: not read\n", line);
+			IOSleep(every_s * 1000);
+			continue;
+		}
+		for (int i = 0; i < 9 && at < (int)sizeof(line); i++) {
+			uint32_t raw = *(volatile uint32_t *)(lvts + sensor[i].at);
+			int mc = (int)((-204650LL * (raw & 0xffff)) >> 14) + 500 * (int)golden + 204650;
+
+			valid += (raw >> 16) & 1;
+			if (golden == 0) {
+				at += snprintf(line + at, sizeof(line) - at, "%s %05x", sensor[i].name, raw);
+			} else if ((raw & 0xffff) == 0) {
+				at += snprintf(line + at, sizeof(line) - at, "%s -", sensor[i].name);
+			} else {
+				at += put_c(line, at, sizeof(line), sensor[i].name, mc);
+				max = any ? MAX(max, mc) : mc;
+				any = 1;
+			}
+		}
+		if (any && at < (int)sizeof(line)) {
+			at += put_c(line, at, sizeof(line), " | max", max);
+		}
+		printf("%s | %d of 9 valid\n", line, valid);
+		IOSleep(every_s * 1000);
+	}
+}
+
+void
+hakios_mt6781_lvts_init(void)
+{
+	thread_t th;
+	uint32_t step = 0;
+
+	PE_parse_boot_argn("lvts_init", &step, sizeof(step));
+	PE_parse_boot_argn("lvts_watch", &every_s, sizeof(every_s));
+	if (step == 0 && every_s == 0) {
+		return;
+	}
+	PE_parse_boot_argn("lvts_golden", &golden, sizeof(golden));
+	lvts = ml_io_map(LVTS_PHYS, 0x1000);
+	infra = ml_io_map(INFRA_PHYS, 0x1000);
+	if (step >= 1) {
+		if (*(volatile uint32_t *)(infra + INFRA_CG0_STA) & INFRA_THERM_CG) {
+			printf("lvts init: the thermal controller's clock is gated: no bring-up\n");
+		} else {
+			init_step1();
+		}
+	}
+	if (every_s == 0) {
+		return;
+	}
+	if (kernel_thread_start(watch, NULL, &th) != KERN_SUCCESS) {
+		printf("lvts: no thread; the temperature is not watched\n");
+		return;
+	}
+	thread_deallocate(th);
+	printf("lvts: the CPU temperature every %u s (lvts_watch=), golden %u%s\n", every_s, golden,
+	    golden ? "" : ": none given, raw values");
+}

@@ -1,4 +1,4 @@
-# mtk/mt6781/drivers/core/conf: the MT6781's watchdog.
+# mtk/mt6781/drivers/core/conf: the MT6781's watchdog and CPU temperature.
 # CONFIG_HAKIOS_<NAME>=y in a defconfig builds a driver into the kernel (docs/drivers-config.md). MediaTek's drivers are
 # `default n`: a configuration has them only when it includes mt6781.config.
 
@@ -7,3 +7,9 @@ driver MT6781_WDT
 	default n
 	help    mtk_wdt_kick=1: the TOPRGU watchdog mtkloader arms (31 s) restarted every 5 s, so a run can be longer; a kernel that
 	help    stops scheduling still ends in its reset. Only the restart key is written
+
+driver MT6781_LVTS
+	file    bsd/dev/hakios.mt6781_lvts.c
+	default n
+	help    lvts_watch=N: the nine LVTS temperature sensors (CPU, modem, GPU) said every N s, in °C with mtkloader's
+	help    lvts_golden=; only read. lvts_init=N: their bring-up, steps 1 to N (writes the thermal block only)

@@ -226,6 +226,7 @@ hakios_input_init(void)
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	hakios_mt6781_wdt_init();       /* first: the others may take a while */
+	hakios_mt6781_lvts_init();
 	hakios_cpufreq_init();
 	hakios_virtio_input_init();
 	hakios_goodix_init();
