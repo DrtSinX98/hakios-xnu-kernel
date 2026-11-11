@@ -107,6 +107,12 @@
 #if SSPM_QUERY && !DVFS_PROBE
 #error "SSPM_QUERY needs DVFS_PROBE"
 #endif
+/* 1 (MT6781): a run that starts SSPM's CPU DVFS (the kernel's MT6781_DVFS, dvfs_step=): at the hand-back no Android
+ * this boot -- the log tail stays on screen until the watchdog resets the phone (XNU_RETURN_WDT), so Android starts
+ * after a whole reset, SSPM's included. */
+#ifndef DVFS_RESET_END
+#define DVFS_RESET_END      0
+#endif
 /* 1: lines of the XNU log that name what the touch screen's start-up goes through (keep_words) are saved even from
  * the part of it that is left out, up to a quarter of the room. */
 #ifndef XNU_LOG_KEEP
@@ -2327,6 +2333,59 @@ static void lvts_args(char *cl)
 	out("\n");
 }
 
+/*
+ * For the kernel's MT6781_DVFS: LK's three operating-point tables (dvfsp@0011bc00's L-table, B-table, CCI-table: 16
+ * rows of MHz, voltage step, post divider, clock divider each), copied here as they are and " dvfs_tbl=<address>" on
+ * the command line (the loader stays in memory under XNU, its addresses physical, as ili_fw=). Nothing if a table is
+ * missing or not 64 cells.
+ */
+static uint32_t dvfs_tbl[3 * 64];
+
+static void dvfs_args(char *cl)
+{
+	static const char *const names[3] = { "L-table", "B-table", "CCI-table" };
+	static const char key[] = " dvfs_tbl=";
+	uint64_t v = (uint64_t)(uintptr_t)dvfs_tbl;
+	char d[24];
+	uint32_t at = 0, n = 0;
+
+	for (uint32_t t = 0; t < 3; t++) {
+		uint32_t len = 0;
+		uint64_t cells = lk_prop(lk_dtb, "dvfsp@0011bc00", names[t], &len);
+
+		if (cells == 0 || len != 64 * 4) {
+			out("dvfs: LK's ");
+			out(names[t]);
+			out(" missing or not 64 cells: no dvfs_tbl\n");
+			return;
+		}
+		for (uint32_t w = 0; w < 64; w++) {
+			dvfs_tbl[64 * t + w] = fdt_get(cells + 4 * w);
+		}
+	}
+	while (cl[at]) {
+		at++;
+	}
+	do {
+		d[n++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v);
+	if (at + sizeof(key) - 1 + n >= BOOT_LINE_LENGTH) {
+		out("dvfs: no room on the command line for dvfs_tbl=\n");
+		return;
+	}
+	for (uint32_t i = 0; key[i]; i++) {
+		cl[at++] = key[i];
+	}
+	while (n) {
+		cl[at++] = d[--n];
+	}
+	cl[at] = 0;
+	out("dvfs: LK's tables for the kernel at ");
+	out_hex((uint64_t)(uintptr_t)dvfs_tbl);
+	out("\n");
+}
+
 static void lvts_show(const char *when)
 {
 	static const char *const what[3] = { "A55s x3, camera", "A76s x2", "modem, GPU x2" };
@@ -2692,6 +2751,14 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 			}
 		}
 		out("sspm: the CPU DVFS channel is clear: Android as usual\n");
+#endif
+#if DVFS_RESET_END && SOC_IS_MT6781
+		out("dvfs: DVFS_RESET_END: SSPM's CPU DVFS was started this boot: no Android now -- the watchdog resets the "
+		    "phone, and Android starts after it\n");
+		show_log_tail(40);
+		for (;;) {
+			dbg_delay_ms(1000);
+		}
 #endif
 		chain_android();
 	}
@@ -3546,6 +3613,7 @@ static void __attribute__((noreturn)) run_xnu(void)
 #endif
 #if DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
 	lvts_args(ba->commandLine);
+	dvfs_args(ba->commandLine);
 #endif
 
 	out("md0 ");

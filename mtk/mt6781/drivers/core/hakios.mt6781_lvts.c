@@ -129,6 +129,30 @@ put_c(char *line, int at, int size, const char *name, int mc)
 	return snprintf(line + at, size - at, "%s %s%d.%d", name, mc < 0 ? "-" : "", d / 10, d % 10);
 }
 
+/*
+ * For MT6781_DVFS: how many of the nine sensors have a reading now, and the hottest of those in m°C (*mc). A reading is
+ * a non-zero raw value, as MediaTek's driver takes it: the valid bit (16) is only reported there, and reading a sensor
+ * seems to clear it (two reads in a row: 9 valid, then 0).
+ */
+int
+hakios_mt6781_lvts_hottest(int *mc)
+{
+	int valid = 0;
+
+	if (lvts == 0 || golden == 0 || (*(volatile uint32_t *)(infra + INFRA_CG0_STA) & INFRA_THERM_CG)) {
+		return 0;
+	}
+	for (int i = 0; i < 9; i++) {
+		uint32_t raw = *(volatile uint32_t *)(lvts + sensor[i].at);
+		int t = (int)((-204650LL * (raw & 0xffff)) >> 14) + 500 * (int)golden + 204650;
+
+		if (raw & 0xffff) {
+			*mc = valid++ ? MAX(*mc, t) : t;
+		}
+	}
+	return valid;
+}
+
 static void
 watch(__unused void *arg, __unused wait_result_t wr)
 {

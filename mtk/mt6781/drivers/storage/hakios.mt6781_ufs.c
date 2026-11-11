@@ -40,7 +40,7 @@
  * and with nothing synchronized, the phone is reset at once (PSCI SYSTEM_RESET): a save cut off as by a power loss.
  *
  * The data volume (boot-arg mtkufs_data=1 read only, 2 writable; with mtkufs_write=1): /dev/mtkufs_data, a block
- * device over darwin past the store's two slots (DATA_FIRST) to its end, which init mounts on /private/var as HFS Plus
+ * device over darwin past the store's two slots and the breadcrumbs' MiB (DATA_FIRST) to its end, which init mounts on /private/var as HFS Plus
  * (var_hfs=mtkufs_data). Every I/O is checked against that window here, so it never reaches the store or the boot
  * settings block; the whitelist still stands under it. Its writes are not read back (mtkufs_readback=1: they are);
  * DKIOCSYNCHRONIZE synchronizes the device's cache (HFS Plus's journal asks it); the end of a run syncs the file
@@ -61,10 +61,13 @@
 #include <sys/errno.h>
 #include <sys/fcntl.h>
 #include <sys/hakios.input.h>
+#include <sys/msgbuf.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
+#include <sys/vnode.h>
+#include <kern/kalloc.h>
 #include <vm/vm_kern.h>
 #include <vm/memory_types.h>
 
@@ -79,6 +82,8 @@ void hakios_mt6781_ufs_quiesce(void);
 void hakios_var_save_on_return(void);
 extern int sync_internal(void);                 /* bsd/vfs/vfs_syscalls.c: the file systems synced, within 5 s */
 static int data_sync(void);
+extern void bsd_log_lock_safe(void);           /* bsd/kern/subr_log.c */
+extern void bsd_log_unlock(void);
 
 #define MUFS_PHYS           0x11270000ULL       /* ufshci@11270000, "mediatek,mt8183-ufshci" */
 #define MUFS_SIZE           0x1000
@@ -139,7 +144,9 @@ static int data_sync(void);
 #define DARWIN_KEEP         256                 /* darwin's first MiB: the boot settings block, never written here */
 #define DARWIN_MINOR        1                   /* /dev/rufs_darwin; minor 0 is xnusys */
 #define DATA_MINOR          2                   /* /dev/mtkufs_data */
-#define DATA_FIRST          (DARWIN_KEEP + 2 * 524288)  /* past the store's two 2 GiB slots (var_store.c SLOT_BYTES) */
+#define CRUMB_FIRST         (DARWIN_KEEP + 2 * 524288)  /* past the store's two 2 GiB slots (var_store.c SLOT_BYTES) */
+#define CRUMB_BLOCKS        256                         /* one MiB of breadcrumbs, one block each */
+#define DATA_FIRST          (CRUMB_FIRST + CRUMB_BLOCKS)
 
 struct mufs_cmd {
 	uint8_t upiu[32];
@@ -161,6 +168,8 @@ static uint32_t darwin_writes, crash_at;        /* this boot's writes to /dev/ru
 static uint32_t data_mode, data_bsize = BLOCK;  /* mtkufs_data=: 1 read only, 2 writable; the volume's block size */
 static uint32_t data_writes, data_crash_at;     /* this boot's writes to /dev/mtkufs_data; mtkufs_data_crash_at=N */
 static bool data_readback, data_written;        /* mtkufs_readback=1; written this boot (synced at the end) */
+static uint32_t crumbs_on, crumb_next;          /* mtkufs_crumbs=1; the next breadcrumb's block */
+static uint64_t crumb_boot;                     /* this boot's counter at its first breadcrumb */
 extern uint32_t psci_smp_hvc;                   /* osfmk/arm64/psci_smp.c: the firmware is called with hvc, else smc */
 static uint64_t dev_blocks;                     /* what the device says it is: xnusys's APFS containers, else all of it */
 static bool apfs_found;
@@ -1078,6 +1087,7 @@ mufs_start(void)
 		crash_at = 0;
 	}
 	PE_parse_boot_argn("mtkufs_data", &data_mode, sizeof(data_mode));
+	PE_parse_boot_argn("mtkufs_crumbs", &crumbs_on, sizeof(crumbs_on));
 	PE_parse_boot_argn("mtkufs_data_crash_at", &data_crash_at, sizeof(data_crash_at));
 	on = 0;
 	data_readback = PE_parse_boot_argn("mtkufs_readback", &on, sizeof(on)) && on != 0;
@@ -1363,6 +1373,48 @@ darwin_rw(struct uio *uio, bool writing)
 }
 
 /*
+ * var_store_log=1: the kernel's message buffer, oldest first, into /private/var/root/hakios-run.log, so that the store
+ * saved next keeps it -- the log of a run that ends in a reset, which no memory survives (read back from Android with
+ * tools/var-store-read.py extract root/hakios-run.log; not under log/, whose contents the store leaves out).
+ */
+static void
+log_into_var(void)
+{
+	vfs_context_t ctx = vfs_context_kernel();
+	uint32_t on = 0, size, x, from = 0;
+	vnode_t vp = NULLVP;
+	char *copy;
+	int error;
+
+	if (!PE_parse_boot_argn("var_store_log", &on, sizeof(on)) || on == 0 || msgbufp == NULL ||
+	    msgbufp->msg_magic != MSG_MAGIC || msgbufp->msg_size <= 0) {
+		return;
+	}
+	size = (uint32_t)msgbufp->msg_size;
+	copy = kalloc_data(size, Z_WAITOK);
+	if (copy == NULL) {
+		return;
+	}
+	bsd_log_lock_safe();
+	x = (uint32_t)msgbufp->msg_bufx % size;
+	memcpy(copy, msgbufp->msg_bufc + x, size - x);
+	memcpy(copy + size - x, msgbufp->msg_bufc, x);
+	bsd_log_unlock();
+	while (from < size && copy[from] == 0) {
+		from++;                                 /* a buffer not yet gone round: its unused start */
+	}
+	error = vnode_open("/private/var/root/hakios-run.log", O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
+	if (error == 0) {
+		error = vn_rdwr(UIO_WRITE, vp, copy + from, (int)(size - from), 0, UIO_SYSSPACE, IO_NOAUTH,
+		    vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
+		vnode_close(vp, FWRITE, ctx);
+	}
+	printf("var_store: the kernel's log, %u bytes, into /private/var/root/hakios-run.log: %s (%d)\n", size - from,
+	    error == 0 ? "written" : "NOT written", error);
+	kfree_data(copy, size);
+}
+
+/*
  * The orderly end of a run (loader_return.c, and the restart hook): if /dev/mtkufs_data was written, the file systems
  * synced and its cache synchronized; then ask the saver for the data volume and wait, bounded, while the system is
  * still whole. No saver registered: no wait.
@@ -1385,6 +1437,7 @@ hakios_var_save_on_return(void)
 		return;
 	}
 	PE_parse_boot_argn("var_save_ms", &ms, sizeof(ms));
+	log_into_var();
 	printf("var_store: the run is ending: the data volume is asked for\n");
 	var_save = VAR_SAVE_WANTED;
 	while (var_save != VAR_SAVE_DONE && waited < ms) {
@@ -1396,6 +1449,44 @@ hakios_var_save_on_return(void)
 	} else {
 		printf("var_store: the saver did not answer in %u ms: the store keeps what it had\n", ms);
 	}
+}
+
+/*
+ * Breadcrumbs (mtkufs_crumbs=1, with mtkufs_write=1): a line of the kernel's, one block each, straight onto darwin's MiB
+ * after the store (CRUMB_FIRST), the device's cache synchronized after each, so that what a run said before a reset
+ * that no memory survives is still there: "crumb <this boot's counter at its first> <n> <seconds>: <line>". Read from
+ * Android: dd if=/dev/block/by-name/darwin bs=4096 skip=1048832 count=256 | strings. The first CRUMB_BLOCKS of a boot
+ * only; each boot starts again at the first block.
+ */
+int
+hakios_mt6781_ufs_crumb(const char *text)
+{
+	uint64_t ns;
+	int error, n;
+
+	if (!crumbs_on || !usable || dead || !write_on || !darwin_ok || dblocks <= DATA_FIRST || crumb_next >= CRUMB_BLOCKS) {
+		return ENXIO;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	lck_mtx_lock(&mufs_lock);
+	if (crumb_boot == 0) {
+		crumb_boot = __builtin_arm_rsr64("CNTPCT_EL0");
+	}
+	memset(darwin_buf, 0, BLOCK);
+	n = snprintf((char *)darwin_buf, BLOCK, "crumb %llx %u %llu.%03llu: %s\n", crumb_boot, crumb_next,
+	    ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / NSEC_PER_MSEC, text);
+	(void)n;
+	error = write_abs(dlba + CRUMB_FIRST + crumb_next, 1, darwin_buf, "a breadcrumb");
+	if (error == 0) {
+		error = mufs_sync();
+	}
+	if (error == 0) {
+		crumb_next++;
+	} else {
+		mufs_errors++;
+	}
+	lck_mtx_unlock(&mufs_lock);
+	return error;
 }
 
 /* ---- the data volume: darwin from DATA_FIRST to its end ---- */

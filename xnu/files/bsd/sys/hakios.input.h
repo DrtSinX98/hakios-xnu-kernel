@@ -57,6 +57,9 @@ void hakios_mt6781_ufs_init(void);     /* mtkufs=1: the realme 8i's UFS partitio
 int hakios_mtk_ufs_root(dev_t *root);  /* mtkufs_root=1: that partition as the root; 0 or an errno */
 void hakios_mt6781_wdt_init(void);     /* mtk_wdt_kick=1: the MT6781's watchdog kicked every 5 s during the run */
 void hakios_mt6781_lvts_init(void);    /* lvts_watch=N: the MT6781's temperature sensors said every N s */
+int hakios_mt6781_lvts_hottest(int *mc); /* how many sensors have a reading; the hottest in m°C */
+void hakios_mt6781_dvfs_init(void);    /* dvfs_step=N: SSPM's CPU DVFS started, steps 1 to N */
+int hakios_mt6781_ufs_crumb(const char *text); /* mtkufs_crumbs=1: a line onto darwin at once; 0 or an errno */
 /* a line kept and said again every minute, so that it reaches the end of a run's log (hakios.mali.c; else only said) */
 void hakios_keep(const char *format, ...) __printflike(1, 2);
 void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */

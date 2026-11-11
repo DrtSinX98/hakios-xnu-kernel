@@ -1,4 +1,4 @@
-# mtk/mt6781/drivers/core/conf: the MT6781's watchdog and CPU temperature.
+# mtk/mt6781/drivers/core/conf: the MT6781's watchdog, CPU temperature and CPU DVFS.
 # CONFIG_HAKIOS_<NAME>=y in a defconfig builds a driver into the kernel (docs/drivers-config.md). MediaTek's drivers are
 # `default n`: a configuration has them only when it includes mt6781.config.
 
@@ -13,3 +13,9 @@ driver MT6781_LVTS
 	default n
 	help    lvts_watch=N: the nine LVTS temperature sensors (CPU, modem, GPU) said every N s, in °C with mtkloader's
 	help    lvts_golden=; only read. lvts_init=N: their bring-up, steps 1 to N (writes the thermal block only)
+
+driver MT6781_DVFS
+	file    bsd/dev/hakios.mt6781_dvfs.c
+	default n
+	help    dvfs_step=N: SSPM's CPU DVFS started as MediaTek's hybrid driver starts it, steps 1 (read only) to 4 (the
+	help    A76s at OPP 7), once all LVTS sensors read valid; at 75 C the A76s go back to OPP 11. Needs mtkloader's dvfs_tbl=

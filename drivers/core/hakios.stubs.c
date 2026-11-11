@@ -101,6 +101,15 @@ void hakios_mt6781_wdt_init(void) {}
 
 #ifndef HAKIOS_MT6781_LVTS
 void hakios_mt6781_lvts_init(void) {}
+int hakios_mt6781_lvts_hottest(__unused int *mc) { return 0; }
+#endif
+
+#ifndef HAKIOS_MT6781_DVFS
+void hakios_mt6781_dvfs_init(void) {}
+#endif
+
+#ifndef HAKIOS_MT6781_UFS
+int hakios_mt6781_ufs_crumb(__unused const char *text) { return ENXIO; }
 #endif
 
 #ifndef HAKIOS_MT6781_UFS
