@@ -1372,19 +1372,37 @@ darwin_rw(struct uio *uio, bool writing)
 	return error;
 }
 
+extern uint32_t loader_log_copy(char *dst, uint32_t max);       /* osfmk/arm64/loader_return.c */
+#define CONSOLE_MAX         (2816u << 10)       /* loader_return's head and ring: the console it keeps */
+
+static int
+write_var_file(const char *path, const char *data, uint32_t len)
+{
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
+
+	if (error == 0) {
+		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0, UIO_SYSSPACE, IO_NOAUTH,
+		    vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
+		vnode_close(vp, FWRITE, ctx);
+	}
+	printf("var_store: %u bytes into %s: %s (%d)\n", len, path, error == 0 ? "written" : "NOT written", error);
+	return error;
+}
+
 /*
- * var_store_log=1: the kernel's message buffer, oldest first, into /private/var/root/hakios-run.log, so that the store
+ * var_store_log=1: the kernel's message buffer, oldest first, into /private/var/root/hakios-run.log, and the console as
+ * loader_return keeps it (its first 256 KB and last 2.5 MB: the processes' lines, tools/latency.py's "tl:") into
+ * /private/var/root/hakios-console.log, so that the store
  * saved next keeps it -- the log of a run that ends in a reset, which no memory survives (read back from Android with
  * tools/var-store-read.py extract root/hakios-run.log; not under log/, whose contents the store leaves out).
  */
 static void
 log_into_var(void)
 {
-	vfs_context_t ctx = vfs_context_kernel();
 	uint32_t on = 0, size, x, from = 0;
-	vnode_t vp = NULLVP;
 	char *copy;
-	int error;
 
 	if (!PE_parse_boot_argn("var_store_log", &on, sizeof(on)) || on == 0 || msgbufp == NULL ||
 	    msgbufp->msg_magic != MSG_MAGIC || msgbufp->msg_size <= 0) {
@@ -1403,15 +1421,13 @@ log_into_var(void)
 	while (from < size && copy[from] == 0) {
 		from++;                                 /* a buffer not yet gone round: its unused start */
 	}
-	error = vnode_open("/private/var/root/hakios-run.log", O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
-	if (error == 0) {
-		error = vn_rdwr(UIO_WRITE, vp, copy + from, (int)(size - from), 0, UIO_SYSSPACE, IO_NOAUTH,
-		    vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
-		vnode_close(vp, FWRITE, ctx);
-	}
-	printf("var_store: the kernel's log, %u bytes, into /private/var/root/hakios-run.log: %s (%d)\n", size - from,
-	    error == 0 ? "written" : "NOT written", error);
+	(void)write_var_file("/private/var/root/hakios-run.log", copy + from, size - from);
 	kfree_data(copy, size);
+	copy = kalloc_data(CONSOLE_MAX, Z_WAITOK);
+	if (copy != NULL) {
+		(void)write_var_file("/private/var/root/hakios-console.log", copy, loader_log_copy(copy, CONSOLE_MAX));
+		kfree_data(copy, CONSOLE_MAX);
+	}
 }
 
 /*

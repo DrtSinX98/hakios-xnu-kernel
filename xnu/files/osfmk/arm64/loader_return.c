@@ -155,6 +155,65 @@ loader_log_put_locked(char c)
 	}
 }
 
+/*
+ * The console as kept so far, oldest first -- the head, then the ring from its oldest character -- copied into dst (at
+ * most max bytes, the newest kept when it is less); the number of bytes. For a log of the run that has to be stored
+ * before the run ends (MT6781_UFS, var_store_log=1). The ring is not changed.
+ */
+uint32_t loader_log_copy(char *dst, uint32_t max);
+
+uint32_t
+loader_log_copy(char *dst, uint32_t max)
+{
+	uint32_t head = loader_log_len < LOADER_LOG_HEAD ? loader_log_len : LOADER_LOG_HEAD, n = 0, ring, skip;
+	uint64_t daif;
+	bool locked = false;
+
+	daif = __builtin_arm_rsr64("DAIF");
+	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
+		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+	}
+	if (loader_log_linear || !loader_log_wrapped) {
+		ring = loader_log_len - head;
+		skip = head + ring > max ? head + ring - max : 0;     /* the oldest go first when it does not fit */
+		if (skip < head) {
+			__builtin_memcpy(dst, loader_log + skip, head - skip);
+			n = head - skip;
+			skip = 0;
+		} else {
+			skip -= head;
+		}
+		__builtin_memcpy(dst + n, loader_log + head + skip, ring - skip);
+		n += ring - skip;
+	} else {
+		uint32_t older = LOADER_LOG_RING - loader_log_ring_at;
+
+		skip = LOADER_LOG_HEAD + LOADER_LOG_RING > max ? LOADER_LOG_HEAD + LOADER_LOG_RING - max : 0;
+		if (skip < LOADER_LOG_HEAD) {
+			__builtin_memcpy(dst, loader_log, LOADER_LOG_HEAD - skip);
+			n = LOADER_LOG_HEAD - skip;
+			skip = 0;
+		} else {
+			skip -= LOADER_LOG_HEAD;
+		}
+		if (skip < older) {
+			__builtin_memcpy(dst + n, loader_log + LOADER_LOG_HEAD + loader_log_ring_at + skip, older - skip);
+			n += older - skip;
+			skip = 0;
+		} else {
+			skip -= older;
+		}
+		__builtin_memcpy(dst + n, loader_log + LOADER_LOG_HEAD + skip, loader_log_ring_at - skip);
+		n += loader_log_ring_at - skip;
+	}
+	if (locked) {
+		os_atomic_store(&loader_log_lock, 0, release);
+	}
+	__builtin_arm_wsr64("DAIF", daif);
+	return n;
+}
+
 /* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */
 static void
 loader_log_linearize(void)
