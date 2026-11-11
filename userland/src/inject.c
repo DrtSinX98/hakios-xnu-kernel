@@ -72,6 +72,28 @@ say(const char *format, ...)
 	write(2, line, (size_t)n);
 }
 
+/* say(), and the same line into the kernel's log with its time (kern.hakios.say, boot-arg hakios_say=1): for the
+ * start-up steps a run's console loses. */
+static void
+say_kernel(const char *format, ...) __printflike(1, 2);
+
+static void
+say_kernel(const char *format, ...)
+{
+	char line[256];
+	va_list ap;
+	int n;
+
+	va_start(ap, format);
+	n = vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	if (n > (int)sizeof(line) - 1) {
+		n = sizeof(line) - 1;
+	}
+	write(2, line, (size_t)n);
+	sysctlbyname("kern.hakios.say", NULL, NULL, line, (size_t)n);
+}
+
 /* Replace one entry of a virtual table (unslid address `slot`) that must now hold `expected`. */
 static void *
 replace_virtual(const char *what, uintptr_t slot, uintptr_t expected, void *replacement)
@@ -796,9 +818,11 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 			usleep(100000);
 		}
 		if (made->opened) {
+			say_kernel("hakios: input: the event server opened \"%s\" (attempt %d)\n", product, attempt);
 			break;
 		}
-		say("hakios: input: the event server has not opened \"%s\" (attempt %d): making it again\n", product, attempt);
+		say_kernel("hakios: input: the event server has not opened \"%s\" (attempt %d): making it again\n", product,
+		    attempt);
 		IOHIDVirtualServiceClientRemove(service);
 		CFRelease(service);
 		service = NULL;
@@ -927,9 +951,10 @@ input_thread(__unused void *arg)
 	sleep(3);                       /* let backboardd get as far as starting its event server */
 	for (unsigned i = 0; screen == NULL && i < sizeof(types) / sizeof(types[0]); i++) {
 		/* this waits until the server (this very program) answers */
+		say_kernel("hakios: input: asking for a HID client of type %d\n", types[i]);
 		client = IOHIDEventSystemClientCreateWithType(NULL, types[i], NULL);
+		say_kernel("hakios: input: HID client of type %d: %p\n", types[i], (void *)client);
 		if (client == NULL) {
-			say("hakios: input: no HID client of type %d\n", types[i]);
 			continue;
 		}
 		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("redwood.input", NULL));
@@ -941,7 +966,7 @@ input_thread(__unused void *arg)
 	if (screen != NULL) {
 		buttons = make_service(client, "HakiOS buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
 	}
-	say("hakios: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
+	say_kernel("hakios: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
 	dispatch_semaphore_signal(input_services_made); /* see wait_for_als_arrival() */
 	if (screen == NULL) {
 		return NULL;
