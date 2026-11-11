@@ -48,7 +48,9 @@
 
 #define BLOCK           4096
 #define BUFFER          (4u << 20)              /* the loader's own buffer: one request a write */
-#define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare */
+#define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare; the
+                                                 * kernel may say otherwise (kern.hakios.var_store_at: the realme 8i's
+                                                 * darwin holds no system, the store starts past its first MiB) */
 #define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots */
 #define SLOTS           2
 #define DEVICE          "/dev/rufs_darwin"
@@ -233,10 +235,25 @@ static off_t stream_limit;              /* the end of the slot: nothing is read 
 static uint32_t stream_crc;
 static uint64_t entries;
 
+static off_t store_at = STORE_AT;
+
+/* where the kernel says the store starts, if it says (a whole number of blocks), else STORE_AT */
+static void
+store_where(void)
+{
+	uint64_t at = 0;
+	size_t size = sizeof(at);
+
+	if (sysctlbyname("kern.hakios.var_store_at", &at, &size, NULL, 0) == 0 && size == sizeof(at) && at != 0 &&
+	    at % BLOCK == 0) {
+		store_at = (off_t)at;
+	}
+}
+
 static off_t
 slot_at(int slot)
 {
-	return STORE_AT + (off_t)slot * SLOT_BYTES;
+	return store_at + (off_t)slot * SLOT_BYTES;
 }
 
 static int
@@ -1362,6 +1379,7 @@ main(int argc, char **argv, char **envp)
 
 	(void)envp;
 	crc_init();
+	store_where();
 	if (strcmp(what, "stamp") == 0) {
 		return stamp(argc > 2 ? argv[2] : "/private/var/hakios-stamp") ? 0 : 1;
 	}
