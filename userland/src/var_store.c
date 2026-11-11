@@ -1278,6 +1278,22 @@ save_once(void)
 	return ok;
 }
 
+/*
+ * SIGTERM is launchd stopping the system (an iOS restart or shutdown). It is blocked rather than caught -- libmini has
+ * no signal trampoline -- so it waits, pending, until the loop below sees it (sigpending) and saves once more.
+ */
+#define SYS_SIGPROCMASK 48
+#define SYS_SIGPENDING  52
+#define SIGTERM_BIT     (1u << (15 - 1))
+
+static int
+term_pending(void)
+{
+	uint32_t pending = 0;
+
+	return mini_syscall(SYS_SIGPENDING, (long)&pending, 0, 0, 0, 0, 0) == 0 && (pending & SIGTERM_BIT) != 0;
+}
+
 static int
 watch(int seconds)
 {
@@ -1296,7 +1312,12 @@ watch(int seconds)
 		printf("var_store: this kernel does not keep the data volume (%s)\n", strerror(errno));
 		return 0;
 	}
-	printf("var_store: watching: the volume is saved when the run ends%s\n",
+	{
+		uint32_t block = SIGTERM_BIT;
+
+		(void)mini_syscall(SYS_SIGPROCMASK, 1 /* SIG_BLOCK */, (long)&block, 0, 0, 0, 0);
+	}
+	printf("var_store: watching: the volume is saved when the run ends or the system stops%s\n",
 	    seconds > 0 ? ", and in between" : "");
 	{
 		struct timeval tv = { 0, 0 };
@@ -1310,6 +1331,22 @@ watch(int seconds)
 
 		if (sysctl_int("kern.hakios.var_save", &state) == 0 && state == VAR_SAVE_WANTED) {
 			asked = 1;
+		}
+		if (term_pending()) {
+			int ok;
+
+			printf("var_store: the system is stopping (SIGTERM): the data volume is saved\n");
+			ok = save_once();
+			if (!ok) {
+				printf("var_store: this save came to nothing; the store keeps what it had\n");
+			}
+			/* answered if the kernel asked meanwhile; else no saver any more, so that it does not wait for one */
+			if (sysctl_int("kern.hakios.var_save", &state) == 0 && state == VAR_SAVE_WANTED) {
+				(void)sysctl_set_int("kern.hakios.var_save", VAR_SAVE_DONE);
+			} else {
+				(void)sysctl_set_int("kern.hakios.var_save", VAR_SAVE_NONE);
+			}
+			return ok;
 		}
 		gettimeofday(&tv, NULL);
 		if (asked || (seconds > 0 && (uint64_t)tv.tv_sec - last >= (uint64_t)seconds)) {

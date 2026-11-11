@@ -15,6 +15,9 @@
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
+	<!-- a restart or shutdown: SIGTERM, and the save after it waited for (src/var_store.c, term_pending) -->
+	<key>ExitTimeOut</key>
+	<integer>60</integer>
 	<key>StandardOutPath</key>
 	<string>/dev/console</string>
 	<key>StandardErrorPath</key>

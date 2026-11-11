@@ -100,6 +100,38 @@ sysctl_hakios_say SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern_hakios, OID_AUTO, say, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
     sysctl_hakios_say, "A", "a line into the kernel's log (boot-arg hakios_say=1)");
 
+/*
+ * An iOS restart or shutdown (reboot(2): launchd has stopped the jobs, the saver among them, which saved on its SIGTERM
+ * -- userland/src/var_store.c): this port has no platform driver to power the phone off or reset it, so it goes back to
+ * the loader the way the end of a run does, and the loader carries on from there (Android, or its menu). The saver is
+ * asked once more on the way, in case it is still there.
+ */
+extern void loader_return(void);
+extern void hakios_var_save_on_return(void);
+extern int (*PE_halt_restart)(unsigned int type);       /* iokit/IOKit/IOPlatformExpert.h (C++) */
+#define HAKIOS_PE_HALT          0                       /* kPEHaltCPU */
+#define HAKIOS_PE_RESTART       1                       /* kPERestartCPU */
+
+static int
+hakios_halt_restart(unsigned int type)
+{
+	if (type == HAKIOS_PE_HALT || type == HAKIOS_PE_RESTART) {
+		printf("hakios: %s: back to the loader\n", type == HAKIOS_PE_HALT ? "shut down" : "restart");
+		hakios_var_save_on_return();
+		loader_return();
+	}
+	return -1;
+}
+
+static void
+hakios_halt_restart_init(void)
+{
+	if (PE_halt_restart == NULL) {
+		PE_halt_restart = hakios_halt_restart;
+	}
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hakios_halt_restart_init);
+
 static void
 hakios_platform_init(void)
 {
