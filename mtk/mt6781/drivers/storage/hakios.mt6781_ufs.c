@@ -26,7 +26,7 @@
  * every read. The doorbell is rung and waited for with interrupts off.
  *
  * Writing (boot-arg mtkufs_write=1, and mtkloader's mtkufs_dlba= mtkufs_dblocks=, checked against the GPT here like
- * xnusys's): WRITE(10) and READ(10) only inside the partition darwin past its first MiB (T26's), SYNCHRONIZE CACHE(10)
+ * xnusys's): WRITE(10) and READ(10) only inside the partition darwin past its first MiB (the boot settings block's), SYNCHRONIZE CACHE(10)
  * of all of it; nothing else ever written. mtkufs_wtest=1 is the dry run: one MiB of a known pattern at darwin + 1 MiB,
  * written, the cache synchronized, read back and compared, with the speed of each.
  *
@@ -126,7 +126,7 @@ void hakios_var_save_on_return(void);
 #define GPT_HEADER          1                   /* the primary GPT, as gpt-carve.py lays it for 4096-byte blocks */
 #define GPT_ENTRIES         2
 #define GPT_ENTRY_BLOCKS    4                   /* 128 entries of 128 bytes */
-#define DARWIN_KEEP         256                 /* darwin's first MiB: T26's configuration, never written here */
+#define DARWIN_KEEP         256                 /* darwin's first MiB: the boot settings block, never written here */
 #define DARWIN_MINOR        1                   /* /dev/rufs_darwin; minor 0 is xnusys */
 
 struct mufs_cmd {
@@ -463,16 +463,16 @@ mufs_selftest_darwin(void)
 		{ 0x2a, UPIU_FLAG_WRITE, 1, 1, UTRD_DD_OUT, 0, true, "WRITE(10) of darwin's last block" },
 		{ 0x2a, UPIU_FLAG_WRITE, 1, 2, UTRD_DD_OUT, 0, false, "WRITE(10) across darwin's end" },
 		{ 0x2a, UPIU_FLAG_WRITE, 4, 1, UTRD_DD_OUT, 0, false, "WRITE(10) past darwin" },
-		{ 0x2a, UPIU_FLAG_WRITE, 2, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of darwin's first block (T26's MiB)" },
-		{ 0x2a, UPIU_FLAG_WRITE, 3, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of the last block of T26's MiB" },
-		{ 0x2a, UPIU_FLAG_WRITE, 3, 2, UTRD_DD_OUT, 0, false, "WRITE(10) across into T26's MiB" },
+		{ 0x2a, UPIU_FLAG_WRITE, 2, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of darwin's first block (the boot settings block)" },
+		{ 0x2a, UPIU_FLAG_WRITE, 3, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of the last block of the boot settings block" },
+		{ 0x2a, UPIU_FLAG_WRITE, 3, 2, UTRD_DD_OUT, 0, false, "WRITE(10) across into the boot settings block" },
 		{ 0x2a, UPIU_FLAG_WRITE, 5, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of xnusys" },
 		{ 0x2a, UPIU_FLAG_WRITE, 6, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of the GPT" },
 		{ 0x2a, UPIU_FLAG_READ, 0, 1, UTRD_DD_OUT, 0, false, "WRITE(10) with the R flag" },
 		{ 0x2a, UPIU_FLAG_WRITE, 0, 1, UTRD_DD_IN, 0, false, "WRITE(10) with data from the device" },
 		{ 0x2a, UPIU_FLAG_WRITE, 0, 1, UTRD_DD_OUT, 0x08, false, "WRITE(10) with FUA" },
 		{ 0x28, UPIU_FLAG_READ, 0, 1, UTRD_DD_IN, 0, true, "READ(10) of darwin + 1 MiB" },
-		{ 0x28, UPIU_FLAG_READ, 2, 1, UTRD_DD_IN, 0, false, "READ(10) of T26's MiB" },
+		{ 0x28, UPIU_FLAG_READ, 2, 1, UTRD_DD_IN, 0, false, "READ(10) of the boot settings block" },
 		{ 0x28, UPIU_FLAG_READ | UPIU_FLAG_WRITE, 0, 1, UTRD_DD_IN, 0, false, "READ(10) of darwin with the W flag" },
 		{ 0x28, UPIU_FLAG_READ, 0, 1, UTRD_DD_OUT, 0, false, "READ(10) of darwin with data to the device" },
 		{ 0x8a, UPIU_FLAG_WRITE, 0, 1, UTRD_DD_OUT, 0, false, "WRITE(16)" },
@@ -507,7 +507,7 @@ mufs_selftest_darwin(void)
 	c.upiu[21] = 1;                         /* a range of blocks */
 	right &= mufs_refusal(c.upiu, c.dw0) != NULL;
 	printf("mtkufs: whitelist for darwin tried on %u commands made up and never sent (writes in, at the edges of and "
-	    "outside its window, T26's MiB, xnusys, the GPT, wrong flags and directions, FUA, WRITE(16), WRITE AND VERIFY, "
+	    "outside its window, the boot settings block, xnusys, the GPT, wrong flags and directions, FUA, WRITE(16), WRITE AND VERIFY, "
 	    "UNMAP, SYNCHRONIZE CACHE whole, IMMED and ranged): %s\n", (unsigned)(sizeof(cases) / sizeof(cases[0])) + 3,
 	    right ? "as it should" : "WRONG");
 	return right;
@@ -1193,7 +1193,7 @@ static uint64_t var_store_at = DARWIN_KEEP * (uint64_t)BLOCK;
 
 SYSCTL_DECL(_kern_hakios);
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, var_store_at, CTLFLAG_RD | CTLFLAG_LOCKED, &var_store_at,
-    "where in darwin the data volume's store starts, in bytes (past T26's MiB)");
+    "where in darwin the data volume's store starts, in bytes (past the boot settings block)");
 
 /* 1 registers the saver, 3 says the volume is in the flash; 2 is the kernel's */
 static int
