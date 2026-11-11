@@ -1,0 +1,9 @@
+# Commands run by the launchd job com.hakios.demo for a performance baseline (RC_JOBS=rc.jobs.perf): nothing of ours
+# loads the processors (no cpu_test), and every process's processor time is taken three times, a minute apart, by
+# Darwin's own ps -- the difference between two of them is each process's CPU over that minute.
+sleep 90
+/bin/ps -A
+sleep 60
+/bin/ps -A
+sleep 60
+/bin/ps -A
