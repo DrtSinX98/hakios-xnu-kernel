@@ -89,7 +89,8 @@
 #endif
 /* 1 (MT6781, with XNU_PARK's device-tree helpers): before XNU, the CPU clocks as they are -- each cluster's PLL and
  * divider, the operating-point tables in LK's device tree (dvfsp@0011bc00), and the start of the CPU DVFS SRAM shared
- * with SSPM ("CSRAM"). Only read. */
+ * with SSPM ("CSRAM"); and, before XNU and again at the hand-back, what of SSPM changes meanwhile (sspm_watch). Only
+ * read. */
 #ifndef DVFS_PROBE
 #define DVFS_PROBE          0
 #endif
@@ -2059,6 +2060,63 @@ static void dvfs_probe(uint64_t dtb)
 		out("\n");
 	}
 }
+
+/*
+ * Whether SSPM runs while XNU does: its memory looked at before XNU and again at the hand-back -- the whole CSRAM and
+ * its DVFS log (which SSPM writes, +0x3d0..+0xf68), each of SSPM's five mailboxes (0x100 each; mailbox 0's slots 26..29
+ * carry the CPU DVFS commands, IPI channel 5), its SRAM in five pieces, and its semaphore register -- as hashes, with the
+ * words that say the DVFS state (+0x320..+0x39f) in full. Only read, of what Android itself maps.
+ */
+#define SSPM_SRAM           0x10400000ULL       /* 0x28000 */
+#define SSPM_CFGREG         0x10440000ULL       /* semaphore at +0x48 */
+#define SSPM_MBOX(n)        (0x10450000ULL + 0x10000ULL * (n))
+
+static uint32_t words_hash(uint64_t at, uint32_t bytes)
+{
+	uint32_t h = 2166136261u;                   /* FNV-1a over 32-bit words */
+
+	for (uint32_t o = 0; o < bytes; o += 4) {
+		h = (h ^ rd32(at + o)) * 16777619u;
+	}
+	return h;
+}
+
+static void sspm_watch(const char *when)
+{
+	out("sspm (");
+	out(when);
+	out("): CSRAM ");
+	out_hex(words_hash(DVFS_CSRAM, 0x1400));
+	out(", its DVFS log ");
+	out_hex(words_hash(DVFS_CSRAM + 0x3d0, 0xf68 - 0x3d0));
+	out("; mailboxes");
+	for (int n = 0; n < 5; n++) {
+		out(" ");
+		out_hex(words_hash(SSPM_MBOX(n), 0x100));
+	}
+	out("; SRAM");
+	for (uint32_t o = 0; o < 0x28000; o += 0x8000) {
+		out(" ");
+		out_hex(words_hash(SSPM_SRAM + o, 0x8000));
+	}
+	out("; semaphore ");
+	out_hex(rd32(SSPM_CFGREG + 0x48));
+	out("\nsspm (");
+	out(when);
+	out("): mailbox 0 slots 26..29 (CPU DVFS):");
+	for (uint32_t k = 26; k < 30; k++) {
+		out(" ");
+		out_hex(rd32(SSPM_MBOX(0) + 4 * k));
+	}
+	out("\nsspm (");
+	out(when);
+	out("): CSRAM +0x320:");
+	for (uint32_t o = 0x320; o < 0x3a0; o += 4) {
+		out(" ");
+		out_hex(rd32(DVFS_CSRAM + o));
+	}
+	out("\n");
+}
 #endif
 
 #if RETURN_CPUS
@@ -2161,6 +2219,9 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 	dbg_puts("=== end of XNU log ===\n");
 	save_host_keep(&xsyms);
 	show_log_tail(40);
+#if DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
+	sspm_watch("at the hand-back");
+#endif
 	if (SOC_IS_MT6781) {
 		/*
 		 * No reset: no DRAM survives one on the MT6781 (MARKER_TEST), so Android starts in this boot,
@@ -3155,6 +3216,7 @@ static void __attribute__((noreturn)) run_xnu(void)
 	}
 #if DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
 	dvfs_probe(lk_dtb);
+	sspm_watch("before XNU");
 #endif
 
 	/* must happen on the core the kernel runs on, and before it sets its GIC up */
