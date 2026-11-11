@@ -87,6 +87,20 @@
 #ifndef XNU_BIG_PSTORE
 #define XNU_BIG_PSTORE      0
 #endif
+/* 1 (MT6781, with XNU_PARK's device-tree helpers): before XNU, the CPU clocks as they are -- each cluster's PLL and
+ * divider, the operating-point tables in LK's device tree (dvfsp@0011bc00), and the start of the CPU DVFS SRAM shared
+ * with SSPM ("CSRAM"). Only read. */
+#ifndef DVFS_PROBE
+#define DVFS_PROBE          0
+#endif
+#if DVFS_PROBE && !XNU_PARK
+#error "DVFS_PROBE reads LK's device tree with XNU_PARK's helpers"
+#endif
+/* 1: lines of the XNU log that name what the touch screen's start-up goes through (keep_words) are saved even from
+ * the part of it that is left out, up to a quarter of the room. */
+#ifndef XNU_LOG_KEEP
+#define XNU_LOG_KEEP        0
+#endif
 #define BIG_CONSOLE_PA      0x4d05f000ULL
 #define BIG_CONSOLE_SIZE    0x80000u
 /* 1: the XNU log is saved up to the kernel's message buffer, which XNU appends last ("--- kernel message buffer ---"):
@@ -1183,25 +1197,51 @@ static int same_line(const volatile char *p, uint64_t k1, uint64_t e1, uint64_t 
 	return 1;
 }
 
-/* Where the saved log is: counting (once, to know how long it comes out) or writing its start and its end. */
+/* Where the saved log is: counting (once, to know how long it comes out) or writing its start and its end -- and, with
+ * XNU_LOG_KEEP, lines of the part in between (kept: their bytes, as far as cap allows; keep_line: this one goes in). */
 struct save_at {
-	uint64_t at, head, skip_to;
-	int counting;
+	uint64_t at, head, skip_to, kept, cap;
+	int counting, keep_line;
 };
 
 static void save_c(struct save_at *s, char c)
 {
 	if (!s->counting) {
-		if (s->at < s->head || s->at >= s->skip_to) {
-			plog_putc(c ? c : ' ');
-		} else if (s->at == s->head) {
+		if (s->at == s->head && s->head < s->skip_to) {
 			dbg_puts("\n\n[... ");
 			dbg_dec(s->skip_to - s->head);
-			dbg_puts(" bytes of the XNU log left out here ...]\n\n");
+			dbg_puts(XNU_LOG_KEEP ? " bytes of the XNU log left out here, but for lines with \"hakios: input\", \"backboardd[\", "
+			    "\"still waiting\" or \"SpringBoard[\" ...]\n\n" :
+			    " bytes of the XNU log left out here ...]\n\n");
+		}
+		if (s->at < s->head || s->at >= s->skip_to || s->keep_line) {
+			plog_putc(c ? c : ' ');
 		}
 	}
 	s->at++;
 }
+
+#if XNU_LOG_KEEP
+static const char *const keep_words[] = { "hakios: input", "backboardd[", "still waiting", "SpringBoard[" };
+
+/* whether [from, to) has one of keep_words in it */
+static int keep_this(const volatile char *p, uint64_t from, uint64_t to)
+{
+	for (unsigned w = 0; w < sizeof(keep_words) / sizeof(keep_words[0]); w++) {
+		uint64_t n = 0;
+
+		while (keep_words[w][n]) {
+			n++;
+		}
+		for (uint64_t i = from; i + n <= to; i++) {
+			if (p[i] == keep_words[w][0] && memcmp_n(p + i, keep_words[w], n) == 0) {
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+#endif
 
 /* The spans as they are saved: a run of lines that are the same (apart from a "[ time ]: " in front) as the first of
  * them, with " (xN)". */
@@ -1223,6 +1263,14 @@ static void save_pass(struct save_at *s, const struct span *sp, int nsp)
 				count++;
 			}
 			stop = count > 1 && p[end - 1] == '\n' ? end - 1 : end;
+#if XNU_LOG_KEEP
+			s->keep_line = 0;
+			if (s->kept + (end - at) + 8 <= s->cap && keep_this(p, at, end) &&
+			    (s->counting || (s->at >= s->head && s->at < s->skip_to))) {
+				s->kept += (end - at) + 8;
+				s->keep_line = !s->counting;
+			}
+#endif
 			for (uint64_t k = at; k < stop; k++) {
 				save_c(s, p[k]);
 			}
@@ -1248,19 +1296,25 @@ static void save_pass(struct save_at *s, const struct span *sp, int nsp)
 			at = next;
 		}
 	}
+	s->keep_line = 0;
 }
 
 /* Append spans (in order) to the ramoops console, folded (save_pass): all of it if it fits, else its start and as much
  * of its end as there is room for. */
 static void save_log(const struct span *sp, int nsp)
 {
-	struct save_at s = { 0, 0, 0, 1 };
+	struct save_at s = { 0 };
 	uint64_t total, room, head, tail;
 
-	save_pass(&s, sp, nsp);
-	total = s.at;
 	room = PLOG_CAP - PLOG_HDR->size;
 	room = room > 1024 ? room - 1024 : 0;
+	s.counting = 1;
+	s.cap = XNU_LOG_KEEP ? room / 4 : 0;
+	save_pass(&s, sp, nsp);
+	total = s.at;
+	if (total > room) {
+		room -= s.kept;         /* the kept lines' share (counted wherever they are: a little room may go unused) */
+	}
 	head = total <= room ? total : room / 4;
 	tail = total <= room ? 0 : room - head;
 
@@ -1269,6 +1323,7 @@ static void save_log(const struct span *sp, int nsp)
 	s.at = 0;
 	s.head = head;
 	s.skip_to = total - tail;
+	s.kept = 0;
 	s.counting = 0;
 	save_pass(&s, sp, nsp);
 	plog_putc('\n');
@@ -1900,6 +1955,111 @@ static int say_parked(void)
 }
 #endif
 
+#if DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
+/* ---- the CPU clocks, only read (addresses and layout as MediaTek's MT6781 cpufreq driver has them) ---- */
+#define DVFS_CSRAM          0x0011bc00ULL       /* 5 KB SRAM: tables at +0x10, current OPP at +0x354, requests at +0x37c */
+
+static void dvfs_probe(uint64_t dtb)
+{
+	static const struct {
+		const char *name;
+		uint64_t con1, div;
+	} pll[3] = {
+		{ "A55s (LL, ARMPLL_LL)", 0x1000c204, 0x0c53a2a0 },
+		{ "A76s (L, ARMPLL_L)", 0x1000c214, 0x0c53a2a4 },
+		{ "CCI (CCIPLL)", 0x1000c2a4, 0x0c53a2e0 },
+	};
+	static const char *const tables[] = { "L-table", "B-table", "CCI-table", "change_flag" };
+
+	for (int i = 0; i < 3; i++) {
+		uint32_t con1 = rd32(pll[i].con1), div = rd32(pll[i].div), post = (con1 >> 24) & 7, ckdiv = (div >> 17) & 0x1f;
+		uint64_t mhz = ((uint64_t)(con1 & 0x3fffff) * 26) >> 14;
+
+		mhz >>= post < 4 ? post : 4;
+		out("dvfs: ");
+		out(pll[i].name);
+		out(": CON1 ");
+		out_hex(con1);
+		out(" -> PLL ");
+		out_dec(mhz);
+		out(" MHz; divider ");
+		out_hex(div);
+		out(" (CKDIV1 ");
+		out_dec(ckdiv);
+		out(ckdiv == 8 || ckdiv == 16 || ckdiv == 24 ? ": none)\n" : ": divides)\n");
+	}
+
+	/* LK's tree: every property of dvfsp@0011bc00 named above, as words (rows of four: MHz, voltage step, post
+	 * divider, clock divider) */
+	uint64_t at = fdt_get(dtb + 8), end = at + fdt_get(dtb + 36), str = dtb + fdt_get(dtb + 12);
+	int depth = 0, inside = 0, found = 0;
+
+	while (fdt_get(dtb) == 0xd00dfeedu && at < end) {
+		uint32_t tok = fdt_get(dtb + at);
+
+		at += 4;
+		if (tok == FDT_BEGIN_NODE) {
+			static const char node[] = "dvfsp@0011bc00";
+			uint64_t n = 0;
+
+			while (((const volatile char *)dtb)[at + n]) {
+				n++;
+			}
+			depth++;
+			if (depth == 2 && n == sizeof(node) - 1 && memcmp_n((const volatile char *)dtb + at, node, n) == 0) {
+				inside = 1;
+			}
+			at += (n + 1 + 3) & ~3ULL;
+		} else if (tok == FDT_END_NODE) {
+			if (inside && depth == 2) {
+				break;
+			}
+			depth--;
+		} else if (tok == FDT_PROP) {
+			uint32_t len = fdt_get(dtb + at), nameoff = fdt_get(dtb + at + 4);
+
+			for (int t = 0; inside && t < 4; t++) {
+				uint64_t n = 0;
+
+				while (tables[t][n]) {
+					n++;
+				}
+				if (memcmp_n((const volatile char *)str + nameoff, tables[t], n + 1) != 0) {
+					continue;
+				}
+				found++;
+				out("dvfs: LK's ");
+				out(tables[t]);
+				out(":");
+				for (uint32_t w = 0; w < len / 4; w++) {
+					out(w % 4 == 0 ? (w % 16 == 0 ? "\n  " : "  |") : " ");
+					out_dec(fdt_get(dtb + at + 8 + 4 * w));
+				}
+				out("\n");
+			}
+			at += 8 + ((len + 3) & ~3u);
+		} else if (tok != FDT_NOP) {
+			break;
+		}
+	}
+	if (!found) {
+		out("dvfs: no dvfsp@0011bc00 tables in LK's device tree\n");
+	}
+
+	/* the CSRAM's first 0x3a0 bytes: tables, data, current Vproc (+0x32c), current OPP (+0x354), requests (+0x37c) */
+	for (uint32_t o = 0; o < 0x3a0; o += 32) {
+		out("dvfs: CSRAM +");
+		out_hex(o);
+		out(":");
+		for (uint32_t w = 0; w < 32; w += 4) {
+			out(" ");
+			out_hex(rd32(DVFS_CSRAM + o + w));
+		}
+		out("\n");
+	}
+}
+#endif
+
 #if RETURN_CPUS
 /* PSCI AFFINITY_INFO (SMC64): 0 on, 1 off, 2 turning on, negative an error */
 static int64_t psci_affinity_info(uint64_t mpidr)
@@ -2149,7 +2309,7 @@ static void rescue_log(void)
 		return;
 	}
 	/* osfmk/arm64/loader_return.c: a 256 KB head, then a 1 MB ring */
-	const uint64_t head_sz = 256 * 1024, ring_sz = 1024 * 1024;
+	const uint64_t head_sz = 256 * 1024, ring_sz = 2560 * 1024;     /* loader_return.c's */
 	const volatile char *log = (const volatile char *)kva_to_pa(s.log);
 	uint32_t len = rd32(kva_to_pa(s.log_len));
 	uint32_t ring_at = rd32(kva_to_pa(s.log_ring_at));
@@ -2992,6 +3152,9 @@ static void __attribute__((noreturn)) run_xnu(void)
 			out("a speed its cycle counter will not say\n");
 		}
 	}
+#if DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
+	dvfs_probe(lk_dtb);
+#endif
 
 	/* must happen on the core the kernel runs on, and before it sets its GIC up */
 	gic_fix_eoimode();
