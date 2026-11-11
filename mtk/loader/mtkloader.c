@@ -97,6 +97,16 @@
 #if DVFS_PROBE && !XNU_PARK
 #error "DVFS_PROBE reads LK's device tree with XNU_PARK's helpers"
 #endif
+/* 1 (MT6781, with DVFS_PROBE): before XNU, one question to SSPM -- IPI_GET_FREQ for the A76s' PLL on its CPU DVFS
+ * channel (sspm_query); its only writes are that message, its doorbell and, if an answer comes, the answer's bit
+ * cleared. At the hand-back: if the message was not taken or an answer is still waiting, no Android this boot -- the
+ * result stays on screen until the watchdog resets the phone (XNU_RETURN_WDT). */
+#ifndef SSPM_QUERY
+#define SSPM_QUERY          0
+#endif
+#if SSPM_QUERY && !DVFS_PROBE
+#error "SSPM_QUERY needs DVFS_PROBE"
+#endif
 /* 1: lines of the XNU log that name what the touch screen's start-up goes through (keep_words) are saved even from
  * the part of it that is left out, up to a quarter of the room. */
 #ifndef XNU_LOG_KEEP
@@ -2110,6 +2120,12 @@ static void sspm_watch(const char *when)
 	}
 	out("\nsspm (");
 	out(when);
+	out("): mailbox 0 set ");
+	out_hex(rd32(SSPM_MBOX(0) + 0x1000));
+	out(", mailbox 2 clear ");
+	out_hex(rd32(SSPM_MBOX(2) + 0x1004));
+	out("\nsspm (");
+	out(when);
 	out("): CSRAM +0x320:");
 	for (uint32_t o = 0x320; o < 0x3a0; o += 4) {
 		out(" ");
@@ -2117,6 +2133,126 @@ static void sspm_watch(const char *when)
 	}
 	out("\n");
 }
+
+#if SSPM_QUERY
+/*
+ * The CPU DVFS channel (IPIS_C_GPU_DVFS, 5, as the vendor's hybrid DVFS driver uses it with SSPM v2): its message in
+ * mailbox 0 at slot 26 (4 words: command, three arguments), rung by bit 26 of mailbox 0's set register; the answer in
+ * mailbox 2 at slot 24 (1 word), raised as bit 24 of mailbox 2's clear register, cleared there by writing it.
+ * IPI_GET_FREQ is 6 with CONFIG_MTK_CPU_MSSV (this phone's kernel); its argument the PLL, 1 = PLL_L_CLUSTER, the A76s.
+ */
+#define SSPM_SEND_BIT       (1u << 26)
+#define SSPM_REPLY_BIT      (1u << 24)
+#define IPI_GET_FREQ        6
+#define PLL_L_CLUSTER       1
+
+static char sspm_result[160] = "sspm: no question asked";
+
+static void sspm_note(const char *s)
+{
+	uint32_t n = 0;
+
+	while (sspm_result[n]) {
+		n++;
+	}
+	while (*s && n + 1 < sizeof(sspm_result)) {
+		sspm_result[n++] = *s++;
+	}
+	sspm_result[n] = 0;
+}
+
+static void sspm_note_dec(uint64_t v)
+{
+	char d[24], c[2] = { 0, 0 };
+	int n = 0;
+
+	do {
+		d[n++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v);
+	while (n) {
+		c[0] = d[--n];
+		sspm_note(c);
+	}
+}
+
+static void sspm_query(void)
+{
+	uint64_t set0 = SSPM_MBOX(0) + 0x1000, clr2 = SSPM_MBOX(2) + 0x1004, msg = SSPM_MBOX(0) + 4 * 26;
+	uint64_t t0, us_take, us_reply = 0, per_us = dbg_freq() / 1000000;
+	uint32_t s0 = rd32(set0), c2 = rd32(clr2), reply = 0;
+	int taken, answered = 0;
+
+	if (per_us == 0) {
+		per_us = 1;
+	}
+	sspm_result[0] = 0;
+	out("sspm: IPI_GET_FREQ (PLL 1, the A76s) on the CPU DVFS channel: mailbox 0 set ");
+	out_hex(s0);
+	out(", mailbox 2 clear ");
+	out_hex(c2);
+	out(" before\n");
+	if ((s0 & SSPM_SEND_BIT) || (c2 & SSPM_REPLY_BIT)) {
+		sspm_note("sspm: NOT SENT: the channel was busy before (bit 26 or 24 already set)");
+		out(sspm_result);
+		out("\n");
+		return;
+	}
+	wr32(msg, IPI_GET_FREQ);
+	wr32(msg + 4, PLL_L_CLUSTER);
+	wr32(msg + 8, 0);
+	wr32(msg + 12, 0);
+	__asm__ volatile("dsb sy");
+	wr32(set0, SSPM_SEND_BIT);
+	t0 = dbg_ticks();
+	while ((rd32(set0) & SSPM_SEND_BIT) && dbg_ticks() - t0 < 100000 * per_us) {
+		dbg_delay_us(10);
+	}
+	us_take = (dbg_ticks() - t0) / per_us;
+	taken = !(rd32(set0) & SSPM_SEND_BIT);
+	if (taken) {
+		t0 = dbg_ticks();
+		while (!(rd32(clr2) & SSPM_REPLY_BIT) && dbg_ticks() - t0 < 2000000 * per_us) {
+			dbg_delay_us(10);
+		}
+		us_reply = (dbg_ticks() - t0) / per_us;
+		if (rd32(clr2) & SSPM_REPLY_BIT) {
+			wr32(clr2, SSPM_REPLY_BIT);     /* as the vendor's polling does: the bit cleared, then the word read */
+			reply = rd32(SSPM_MBOX(2) + 4 * 24);
+			answered = 1;
+		}
+	}
+	if (!taken) {
+		sspm_note("sspm: NOT TAKEN in 100 ms (bit 26 still set): SSPM is not taking messages");
+	} else if (!answered) {
+		sspm_note("sspm: taken after ");
+		sspm_note_dec(us_take);
+		sspm_note(" us, NO ANSWER in 2000 ms: SSPM alive, this question not answered");
+	} else {
+		sspm_note("sspm: taken after ");
+		sspm_note_dec(us_take);
+		sspm_note(" us, answered after ");
+		sspm_note_dec(us_reply);
+		sspm_note(" us: ");
+		sspm_note_dec(reply);
+		sspm_note(" (our PLL read: 1084 MHz)");
+	}
+	out(sspm_result);
+	out("\nsspm: the answer word ");
+	out_hex(reply);
+	out("; mailbox 0 set ");
+	out_hex(rd32(set0));
+	out(", mailbox 2 clear ");
+	out_hex(rd32(clr2));
+	out(" after\n");
+}
+
+/* at the hand-back: the channel as Android must find it -- nothing waiting either way */
+static int sspm_channel_clean(void)
+{
+	return !(rd32(SSPM_MBOX(0) + 0x1000) & SSPM_SEND_BIT) && !(rd32(SSPM_MBOX(2) + 0x1004) & SSPM_REPLY_BIT);
+}
+#endif
 #endif
 
 #if RETURN_CPUS
@@ -2297,6 +2433,21 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 		dbg_delay_ms(10000);
 #else
 		dbg_delay_ms(5000);
+#endif
+#if SSPM_QUERY && DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
+		out(sspm_result);
+		out("\n");
+		if (!sspm_channel_clean()) {
+			out("sspm: the CPU DVFS channel is not clear (mailbox 0 set ");
+			out_hex(rd32(SSPM_MBOX(0) + 0x1000));
+			out(", mailbox 2 clear ");
+			out_hex(rd32(SSPM_MBOX(2) + 0x1004));
+			out("): no Android this boot -- the watchdog resets the phone (XNU_RETURN_WDT)\n");
+			for (;;) {
+				dbg_delay_ms(1000);
+			}
+		}
+		out("sspm: the CPU DVFS channel is clear: Android as usual\n");
 #endif
 		chain_android();
 	}
@@ -3217,6 +3368,10 @@ static void __attribute__((noreturn)) run_xnu(void)
 #if DVFS_PROBE && XNU_PARK && SOC_IS_MT6781
 	dvfs_probe(lk_dtb);
 	sspm_watch("before XNU");
+#if SSPM_QUERY
+	sspm_query();
+	sspm_watch("after the question");
+#endif
 #endif
 
 	/* must happen on the core the kernel runs on, and before it sets its GIC up */
