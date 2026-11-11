@@ -556,6 +556,73 @@ hakios_ddr_quiesce(void)
 	tell("ddr: memory bandwidth vote %u for the loader: %s\n", rest, done ? "done" : "FAILED");
 }
 
+/*
+ * Boot-arg coremhz=1: each of our cores' clock, once, 5 s into the boot -- its cycle counter (PMCCNTR_EL0) against the
+ * system counter (CNTVCT_EL0) over 10 ms, on all the cores at once (an interrupt each, interrupts off):
+ *   coremhz: 0:1865 1:1865 ... (4 of 4 cores)      the core's number (as in its MPIDR), then its MHz; 0: no count
+ * Only the core's own cycle counter is switched on (counting at every level, no divider); no clock is touched.
+ */
+#define COREMHZ_CPUS            8
+
+static struct {
+	uint32_t n, core[COREMHZ_CPUS], mhz[COREMHZ_CPUS];
+} coremhz;
+
+static void
+coremhz_one(void *arg __unused)
+{
+	boolean_t on = ml_set_interrupts_enabled(FALSE);
+	uint64_t t0, t1, c0, c1, end, ns;
+	uint32_t i = os_atomic_inc_orig(&coremhz.n, relaxed);
+
+	__builtin_arm_wsr64("PMCCFILTR_EL0", 0);
+	__builtin_arm_wsr64("PMCR_EL0", (__builtin_arm_rsr64("PMCR_EL0") | 1) & ~8ull);   /* E on, D off */
+	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ull << 31);
+	__builtin_arm_isb(15);         /* SY */
+	nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &end);
+	t0 = __builtin_arm_rsr64("CNTVCT_EL0");
+	c0 = __builtin_arm_rsr64("PMCCNTR_EL0");
+	end += t0;
+	do {
+		t1 = __builtin_arm_rsr64("CNTVCT_EL0");
+	} while (t1 < end);
+	c1 = __builtin_arm_rsr64("PMCCNTR_EL0");
+	ml_set_interrupts_enabled(on);
+	absolutetime_to_nanoseconds(t1 - t0, &ns);
+	if (i < COREMHZ_CPUS) {
+		coremhz.core[i] = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff;
+		coremhz.mhz[i] = ns != 0 && c1 > c0 ? (uint32_t)((c1 - c0) * 1000 / ns) : 0;
+	}
+}
+
+static void
+coremhz_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	char line[160];
+	int at;
+	uint32_t n;
+
+	delay_for_interval(5000, NSEC_PER_MSEC);
+	cpu_broadcast_xcall_simple(TRUE, coremhz_one, NULL);
+	n = MIN(os_atomic_load(&coremhz.n, relaxed), COREMHZ_CPUS);
+	at = snprintf(line, sizeof(line), "coremhz:");
+	for (uint32_t i = 0; i < n && at < (int)sizeof(line) - 12; i++) {
+		at += snprintf(line + at, sizeof(line) - at, " %u:%u", coremhz.core[i], coremhz.mhz[i]);
+	}
+	tell("%s (%u of %u cores)\n", line, n, ml_get_topology_info()->num_cpus);
+}
+
+static void
+coremhz_start(void)
+{
+	uint32_t on = 0;
+	thread_t thread;
+
+	if (PE_parse_boot_argn("coremhz", &on, sizeof(on)) && on && kernel_thread_start(coremhz_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
 void
 hakios_cpufreq_init(void)
 {
@@ -563,6 +630,7 @@ hakios_cpufreq_init(void)
 	uint32_t enabled = 0, membench = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
 
 	load_start();
+	coremhz_start();
 	enabled = 2;
 	PE_parse_boot_argn("ddr", &enabled, sizeof(enabled));
 	if (enabled == 1) {
