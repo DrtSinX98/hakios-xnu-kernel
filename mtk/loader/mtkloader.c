@@ -80,6 +80,20 @@
 #define XNU_PARK            0
 #endif
 #define PARK_PA             0x4cdff000ULL
+/* 1 (MT6781): at the hand-back, ramoops' console zone made as big as its 0xe0000 allows (ramoops rounds each zone down
+ * to a power of two) -- LK's command line in its device tree says ramoops.console_size=0x80000 instead of 0x40000 (in
+ * place, the same length), and this loader's console moves to where Android will then look for it (dump records,
+ * console, ftrace 4 KB, pmsg 64 KB, in that order). */
+#ifndef XNU_BIG_PSTORE
+#define XNU_BIG_PSTORE      0
+#endif
+#define BIG_CONSOLE_PA      0x4d05f000ULL
+#define BIG_CONSOLE_SIZE    0x80000u
+/* 1: the XNU log is saved up to the kernel's message buffer, which XNU appends last ("--- kernel message buffer ---"):
+ * the console's own lines -- tl:, programs' output, launchd's -- make the kept tail instead of the timestamped buffer. */
+#ifndef XNU_LOG_CONSOLE
+#define XNU_LOG_CONSOLE     0
+#endif
 #define PARK_NODE           "hakios-pen@4cdff000"
 #define PARK_NODE_BYTES     68      /* begin, the name (20), reg (12 + 16), no-map (12), end */
 /*
@@ -1136,38 +1150,173 @@ struct span {
 	uint64_t n;
 };
 
-/* Append spans (in order) to the ramoops console: all of it if it fits, else its start and
- * as much of its end as there is room for. */
+/* A line of the log: [at, *end), *end past its '\n'; returned, where it starts once a "[ time ]: " in front is skipped. */
+static uint64_t log_line(const volatile char *p, uint64_t n, uint64_t at, uint64_t *end)
+{
+	uint64_t e = at, key = at;
+
+	while (e < n && p[e] != '\n') {
+		e++;
+	}
+	*end = e < n ? e + 1 : n;
+	if (p[at] == '[') {
+		for (uint64_t i = at + 1; i + 2 < e && i < at + 24; i++) {
+			if (p[i] == ']' && p[i + 1] == ':' && p[i + 2] == ' ') {
+				key = i + 3;
+				break;
+			}
+		}
+	}
+	return key;
+}
+
+static int same_line(const volatile char *p, uint64_t k1, uint64_t e1, uint64_t k2, uint64_t e2)
+{
+	if (e1 - k1 != e2 - k2) {
+		return 0;
+	}
+	for (uint64_t i = 0; i < e1 - k1; i++) {
+		if (p[k1 + i] != p[k2 + i]) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* Where the saved log is: counting (once, to know how long it comes out) or writing its start and its end. */
+struct save_at {
+	uint64_t at, head, skip_to;
+	int counting;
+};
+
+static void save_c(struct save_at *s, char c)
+{
+	if (!s->counting) {
+		if (s->at < s->head || s->at >= s->skip_to) {
+			plog_putc(c ? c : ' ');
+		} else if (s->at == s->head) {
+			dbg_puts("\n\n[... ");
+			dbg_dec(s->skip_to - s->head);
+			dbg_puts(" bytes of the XNU log left out here ...]\n\n");
+		}
+	}
+	s->at++;
+}
+
+/* The spans as they are saved: a run of lines that are the same (apart from a "[ time ]: " in front) as the first of
+ * them, with " (xN)". */
+static void save_pass(struct save_at *s, const struct span *sp, int nsp)
+{
+	for (int i = 0; i < nsp; i++) {
+		const volatile char *p = sp[i].p;
+		uint64_t n = sp[i].n;
+
+		for (uint64_t at = 0; at < n;) {
+			uint64_t end, next, end2, count = 1, key = log_line(p, n, at, &end), stop;
+
+			for (next = end; next < n; next = end2) {
+				uint64_t key2 = log_line(p, n, next, &end2);
+
+				if (!same_line(p, key, end, key2, end2)) {
+					break;
+				}
+				count++;
+			}
+			stop = count > 1 && p[end - 1] == '\n' ? end - 1 : end;
+			for (uint64_t k = at; k < stop; k++) {
+				save_c(s, p[k]);
+			}
+			if (count > 1) {
+				char d[24];
+				int nd = 0;
+
+				do {
+					d[nd++] = (char)('0' + count % 10);
+					count /= 10;
+				} while (count);
+				save_c(s, ' ');
+				save_c(s, '(');
+				save_c(s, 'x');
+				while (nd) {
+					save_c(s, d[--nd]);
+				}
+				save_c(s, ')');
+				if (stop != end) {
+					save_c(s, '\n');
+				}
+			}
+			at = next;
+		}
+	}
+}
+
+/* Append spans (in order) to the ramoops console, folded (save_pass): all of it if it fits, else its start and as much
+ * of its end as there is room for. */
 static void save_log(const struct span *sp, int nsp)
 {
-	uint64_t total = 0, room, head, tail, skip_to, at = 0;
+	struct save_at s = { 0, 0, 0, 1 };
+	uint64_t total, room, head, tail;
 
-	for (int i = 0; i < nsp; i++) {
-		total += sp[i].n;
-	}
+	save_pass(&s, sp, nsp);
+	total = s.at;
 	room = PLOG_CAP - PLOG_HDR->size;
 	room = room > 1024 ? room - 1024 : 0;
 	head = total <= room ? total : room / 4;
 	tail = total <= room ? 0 : room - head;
-	skip_to = total - tail;
 
 	uint64_t fb = fbc.base;
 	fbc.base = 0; /* the screen gets the tail, separately */
-	for (int i = 0; i < nsp; i++) {
-		for (uint64_t k = 0; k < sp[i].n; k++, at++) {
-			if (at < head || at >= skip_to) {
-				char c = sp[i].p[k];
-				plog_putc(c ? c : ' ');
-			} else if (at == head) {
-				dbg_puts("\n\n[... ");
-				dbg_dec(skip_to - head);
-				dbg_puts(" bytes of the XNU log left out here ...]\n\n");
-			}
-		}
-	}
+	s.at = 0;
+	s.head = head;
+	s.skip_to = total - tail;
+	s.counting = 0;
+	save_pass(&s, sp, nsp);
 	plog_putc('\n');
 	fbc.base = fb;
 }
+
+#if XNU_BIG_PSTORE && SOC_IS_MT6781
+/* ramoops' console made BIG_CONSOLE_SIZE in LK's command line, and this loader's console moved there with what it holds */
+static void plog_grow(uint64_t dtb)
+{
+	static const char key[] = "ramoops.console_size=0x40000";
+	volatile char *b = (volatile char *)dtb;
+	const volatile uint8_t *t = (const volatile uint8_t *)(dtb + 4);
+	uint32_t total = (uint32_t)t[0] << 24 | (uint32_t)t[1] << 16 | (uint32_t)t[2] << 8 | t[3];
+	uint64_t hit = 0;
+	int hits = 0;
+	uint32_t start = PLOG_HDR->start, size = PLOG_HDR->size, cap = PLOG_CAP;
+	volatile char *to = (volatile char *)(BIG_CONSOLE_PA + sizeof(struct ramoops_hdr));
+
+	for (uint64_t i = 0; i + sizeof(key) - 1 <= total; i++) {
+		if (b[i] == 'r' && memcmp_n(b + i, key, sizeof(key) - 1) == 0) {
+			hit = i;
+			hits++;
+		}
+	}
+	if (hits != 1 || PLOG_HDR->sig != RAMOOPS_SIG || size > cap || start > cap) {
+		out("pstore: LK's command line not changed (ramoops.console_size=0x40000 found ");
+		out_dec((uint64_t)hits);
+		out(" times): the console stays 256 KB\n");
+		return;
+	}
+	b[hit + sizeof(key) - 1 - 5] = '8';                    /* 0x40000 -> 0x80000 */
+	for (uint32_t j = 0; j < size; j++) {                   /* oldest first (lands below the old zone) */
+		to[j] = PLOG_DATA[(start + cap - size + j) % cap];
+	}
+	plog_base = BIG_CONSOLE_PA;
+	plog_zone = BIG_CONSOLE_SIZE;
+	PLOG_HDR->sig = RAMOOPS_SIG;
+	PLOG_HDR->start = size;
+	PLOG_HDR->size = size;
+	__asm__ volatile("dsb sy");
+	out("pstore: ramoops' console made ");
+	out_hex(BIG_CONSOLE_SIZE);
+	out(" at ");
+	out_hex(BIG_CONSOLE_PA);
+	out(" (LK's command line changed)\n");
+}
+#endif
 
 /*
  * The kernel's lines for the host (kern.redwood.host_keep, bsd/dev/redwood_mali.c) into ramoops' pmsg
@@ -1782,6 +1931,9 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 {
 	struct span sp = { (const volatile char *)log_pa, len };
 
+#if XNU_BIG_PSTORE && SOC_IS_MT6781
+	plog_grow(lk_dtb);
+#endif
 #if XNU_RETURN_WDT
 	wr32(TOPRGU_RESTART, TOPRGU_RESTART_KEY);       /* its full length again, from here */
 #else
@@ -1831,6 +1983,19 @@ void xnu_returned(uint64_t log_pa, uint64_t len, uint64_t reason, uint64_t code,
 	if (len > 4 * 1024 * 1024) {
 		sp.n = 0;
 	}
+#if XNU_LOG_CONSOLE
+	{
+		static const char mark[] = "\n--- kernel message buffer ---\n";
+
+		for (uint64_t i = 0; i + sizeof(mark) - 1 <= sp.n; i++) {
+			if (sp.p[i] == '\n' && memcmp_n(sp.p + i, mark, sizeof(mark) - 1) == 0) {
+				out("(the kernel's message buffer left out: XNU_LOG_CONSOLE)\n");
+				sp.n = i + 1;
+				break;
+			}
+		}
+	}
+#endif
 	save_log(&sp, 1);
 	dbg_puts("=== end of XNU log ===\n");
 	save_host_keep(&xsyms);
@@ -2166,7 +2331,7 @@ static volatile uint64_t watcher_started __attribute__((aligned(64)));
 
 static void plog_flush(void)
 {
-	dcache_clean_range(RAMOOPS_CONSOLE, RAMOOPS_CONSOLE_SIZE);
+	dcache_clean_range(plog_base, plog_zone);
 	dcache_clean_range(MARKER_PA, 192);
 }
 

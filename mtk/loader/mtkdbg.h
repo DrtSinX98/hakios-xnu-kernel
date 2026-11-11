@@ -128,9 +128,13 @@ struct ramoops_hdr {
 	uint32_t size;
 };
 
-#define PLOG_HDR  ((volatile struct ramoops_hdr *)RAMOOPS_CONSOLE)
-#define PLOG_DATA ((volatile char *)(RAMOOPS_CONSOLE + sizeof(struct ramoops_hdr)))
-#define PLOG_CAP  (RAMOOPS_CONSOLE_SIZE - sizeof(struct ramoops_hdr))
+/* where the console zone is: Android's layout as LK's command line has it, unless the loader has made it bigger
+ * (mtkloader.c, XNU_BIG_PSTORE) */
+static uint64_t plog_base __attribute__((unused)) = RAMOOPS_CONSOLE;
+static uint32_t plog_zone __attribute__((unused)) = RAMOOPS_CONSOLE_SIZE;
+#define PLOG_HDR  ((volatile struct ramoops_hdr *)plog_base)
+#define PLOG_DATA ((volatile char *)(plog_base + sizeof(struct ramoops_hdr)))
+#define PLOG_CAP  (plog_zone - sizeof(struct ramoops_hdr))
 
 static inline void plog_reset(void)
 {
