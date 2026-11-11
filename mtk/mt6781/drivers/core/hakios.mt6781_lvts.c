@@ -14,6 +14,9 @@
  *      controller its clock on (+0xe4), its devices reset, their ID read back (+0x4c; expected 0x81 + controller)
  *   2  each controller's devices set up: counting stopped, auto RCK, low-power single mode, its delay, a 20 us
  *      counting window, the chopper and reserved settings (eleven device writes through +0x50, 3 us apart)
+ *   3  calibration: each controller's devices to manual RCK; for each sensor, selected, an RC count kicked off and
+ *      read back (+0xb0), deselected, and its EDATA (+0x54 + 4 * n) set to RC count * count_r >> 14, count_r from
+ *      the chip's efuse (mtkloader's lvts_r=, its nine counts in MediaTek's sensor order)
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -37,6 +40,11 @@ extern void IOSleep(unsigned int milliseconds);
 #define LVTS_CLKEN          0xe4
 #define DEV_WRITE(reg, v)   (0xc1030000u | (reg) << 8 | (v))
 #define DEV_READ_ID         0xc502fc55u         /* the devices' ID read back into LVTS_ID */
+#define DEV_READ(reg)       (0xc1020000u | (reg) << 8)  /* a device register into LVTS_RDATA */
+#define CFG_ACCESS          (1u << 24)          /* LVTS_CONFIG: a device access under way */
+#define CFG_SENSING         (1u << 25)          /* LVTS_CONFIG: a device counting */
+#define LVTS_EDATA(n)       (0x54 + 4 * (n))
+#define LVTS_RDATA          0xb0
 
 static const struct {
 	const char *name;
@@ -165,6 +173,86 @@ init_step2(void)
 	}
 }
 
+static void
+dev_wr(vm_offset_t tc, uint32_t reg, uint32_t v)
+{
+	wr(tc + LVTS_CONFIG, DEV_WRITE(reg, v));
+	IODelay(3);
+}
+
+/* whether the bit of LVTS_CONFIG went to 0 within 200 us */
+static bool
+cfg_clear(vm_offset_t tc, uint32_t bit)
+{
+	for (int i = 0; i < 100; i++) {
+		if (!(*(volatile uint32_t *)(tc + LVTS_CONFIG) & bit)) {
+			return true;
+		}
+		IODelay(2);
+	}
+	return false;
+}
+
+/* step 3: the RC calibration, and each sensor's EDATA from it and the efuse's count_r */
+static void
+init_step3(void)
+{
+	static const uint32_t sensors[3] = { 4, 2, 3 };
+	char arg[96] = "";
+	uint32_t count_r[9], n = 0, s = 0;
+
+	if (PE_parse_boot_argn("lvts_r", arg, sizeof(arg)) && arg[0] == 'r') {
+		for (const char *p = arg + 1; n < 9 && *p;) {
+			uint32_t v = 0;
+
+			for (; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'); p++) {
+				v = v << 4 | (uint32_t)(*p <= '9' ? *p - '0' : *p - 'a' + 10);
+			}
+			count_r[n++] = v;
+			if (*p != '.') {
+				break;
+			}
+			p++;
+		}
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		if (count_r[i] == 0 || count_r[i] > 0xffffff) {
+			n = 0;
+		}
+	}
+	if (n != 9) {
+		printf("lvts init 3: no lvts_r= with nine counts from mtkloader (\"%s\"): no calibration\n", arg);
+		return;
+	}
+	for (uint32_t c = 0; c < 3; c++) {
+		vm_offset_t tc = lvts + 0x100 * c;
+
+		dev_wr(tc, 0x0e, 0x00);                 /* manual RCK */
+		for (uint32_t j = 0; j < sensors[c]; j++, s++) {
+			uint32_t rc, edata;
+			bool counted, read;
+
+			dev_wr(tc, 0x0d, j);                /* sensor j, with RCK */
+			dev_wr(tc, 0x06, 0xb8);             /* low-power single mode */
+			dev_wr(tc, 0x05, 0x00);             /* counting window: 20 us */
+			dev_wr(tc, 0x04, 0x20);
+			dev_wr(tc, 0x03, 0x02);             /* RC counting kicked off */
+			IODelay(50);
+			counted = cfg_clear(tc, CFG_SENSING);
+			wr(tc + LVTS_CONFIG, DEV_READ(0x00));
+			IODelay(5);
+			read = cfg_clear(tc, CFG_ACCESS);
+			rc = *(volatile uint32_t *)(tc + LVTS_RDATA) & 0xffffff;
+			dev_wr(tc, 0x0d, 0x10 | j);         /* sensor j, without RCK: as for reading temperatures */
+			edata = (uint32_t)(((uint64_t)rc * count_r[s]) >> 14);
+			wr(tc + LVTS_EDATA(j), edata);
+			printf("lvts init 3: sensor %u (controller %u, %u): count_r %x, RC now %x%s%s, EDATA %x (reads %x)\n", s, c,
+			    j, count_r[s], rc, counted ? "" : " (still counting after 200 us)", read ? "" : " (read not done)",
+			    edata, *(volatile uint32_t *)(tc + LVTS_EDATA(j)));
+		}
+	}
+}
+
 void
 hakios_mt6781_lvts_init(void)
 {
@@ -186,6 +274,9 @@ hakios_mt6781_lvts_init(void)
 			init_step1();
 			if (step >= 2) {
 				init_step2();
+			}
+			if (step >= 3) {
+				init_step3();
 			}
 		}
 	}

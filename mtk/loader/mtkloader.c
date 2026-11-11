@@ -2251,7 +2251,9 @@ static uint64_t lk_prop(uint64_t dtb, const char *node, const char *prop, uint32
 }
 
 /* " lvts_golden=<n>" onto the kernel's command line, and the chip's speed bin (efuse word 7) said; the devinfo
- * words are LK's memory as it is (little-endian), not the tree's big-endian cells */
+ * words are LK's memory as it is (little-endian), not the tree's big-endian cells. With them, " lvts_r=r<hex>.<hex>..."
+ * (a string: a number would not hold nine): the nine sensors' calibration counts (count_r, bits 23..0 of efuse words
+ * 118, 119, 190..196, in MediaTek's sensor order), for the kernel's calibration step. */
 static void lvts_args(char *cl)
 {
 	uint32_t len = 0;
@@ -2280,8 +2282,8 @@ static void lvts_args(char *cl)
 	while (*at) {
 		at++;
 	}
-	if ((uint32_t)(at - cl) + 20 >= BOOT_LINE_LENGTH) {
-		out("lvts: no room on the command line; no lvts_golden\n");
+	if ((uint32_t)(at - cl) + 90 >= BOOT_LINE_LENGTH) {
+		out("lvts: no room on the command line; no lvts_golden, no lvts_r\n");
 		return;
 	}
 	for (const char *s = " lvts_golden="; *s; s++) {
@@ -2295,6 +2297,34 @@ static void lvts_args(char *cl)
 	}
 	*at++ = (char)('0' + lvts_golden % 10);
 	*at = 0;
+	if (len < 4 * 198) {
+		out("lvts: devinfo too short for the calibration counts: no lvts_r\n");
+		return;
+	}
+	out("lvts: count_r:");
+	for (const char *s = " lvts_r=r"; *s; s++) {
+		*at++ = *s;
+	}
+	for (uint32_t i = 0; i < 9; i++) {
+		uint32_t word = i < 2 ? 118 + i : 190 + (i - 2), v = rd32(info + 4 * (word + 1)) & 0xffffff;
+		int shown = 0;
+
+		out(" ");
+		out_hex(v);
+		if (i) {
+			*at++ = '.';
+		}
+		for (int sh = 20; sh >= 0; sh -= 4) {
+			uint32_t d = (v >> sh) & 0xf;
+
+			if (d || shown || sh == 0) {
+				*at++ = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+				shown = 1;
+			}
+		}
+	}
+	*at = 0;
+	out("\n");
 }
 
 static void lvts_show(const char *when)
