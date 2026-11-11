@@ -102,7 +102,12 @@ _Static_assert(XNU_CORES >= 1 && XNU_CORES <= 7, "one core at least, and one lef
  * leaves us on core 0), then the two Cortex-A75s, which are about twice the Cortex-A55s, then
  * the rest of the A55s. So "cpus=3" already gives iOS both fast cores.
  */
-#if SOC_IS_MT6781
+/* 1 (MT6781): the A76s too, in the Hot 20's order (0, 7, 6, 1, ...): they run at whatever clock LK left them at, with
+ * nothing here to manage their heat -- for measuring, in short runs. */
+#ifndef XNU_BIG_CORES
+#define XNU_BIG_CORES       0
+#endif
+#if SOC_IS_MT6781 && !XNU_BIG_CORES
 /* the realme 8i: its six Cortex-A55s first; the two A76s (6, 7) last, their clock is not set up here (big_cores_clock
  * is the Hot 20's) */
 static const uint8_t core_order[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
