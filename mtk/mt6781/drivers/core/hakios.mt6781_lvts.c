@@ -17,6 +17,10 @@
  *   3  calibration: each controller's devices to manual RCK; for each sensor, selected, an RC count kicked off and
  *      read back (+0xb0), deselected, and its EDATA (+0x54 + 4 * n) set to RC count * count_r >> 14, count_r from
  *      the chip's efuse (mtkloader's lvts_r=, its nine counts in MediaTek's sensor order)
+ *   4  sensing: each controller's sensing off (MONCTL0), its sensor select (+0x40) and calculation scale (+0x48), its
+ *      devices in single mode, the polling period and filter (MONCTL1/2: 46.5 us units, 2 of 4 samples, MSRCTL0
+ *      +0x38), then its sensing points on (MONCTL0 0x20f, 0x203, 0x207). No interrupt (MONINT) and no hardware
+ *      over-temperature trip is set: nothing here can reset the phone.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -44,6 +48,13 @@ extern void IOSleep(unsigned int milliseconds);
 #define CFG_ACCESS          (1u << 24)          /* LVTS_CONFIG: a device access under way */
 #define CFG_SENSING         (1u << 25)          /* LVTS_CONFIG: a device counting */
 #define LVTS_EDATA(n)       (0x54 + 4 * (n))
+#define LVTS_MONCTL0        0x00                /* the sensing points on, bit per point, and 0x200 */
+#define LVTS_MONCTL1        0x04
+#define LVTS_MONCTL2        0x08
+#define LVTS_MONINT         0x0c
+#define LVTS_MSRCTL0        0x38
+#define LVTS_TSSEL          0x40
+#define LVTS_CALSCALE       0x48
 #define LVTS_RDATA          0xb0
 
 static const struct {
@@ -253,6 +264,37 @@ init_step3(void)
 	}
 }
 
+/* step 4: the controllers set to measure, then their sensing points on */
+static void
+init_step4(void)
+{
+	static const uint32_t points[3] = { 0x20f, 0x203, 0x207 };      /* four, two, three sensors */
+
+	for (uint32_t c = 0; c < 3; c++) {
+		wr(lvts + 0x100 * c + LVTS_MONCTL0, 0);
+	}
+	for (uint32_t c = 0; c < 3; c++) {
+		vm_offset_t tc = lvts + 0x100 * c;
+
+		wr(tc + LVTS_TSSEL, 0x13121110);
+		wr(tc + LVTS_CALSCALE, 0x300);
+		dev_wr(tc, 0x06, 0xb8);                 /* single mode */
+		wr(tc + LVTS_MONCTL1, 1u << 20 | 0x00c); /* group delay 1, period 12 x 256 bus clocks: 46.5 us */
+		wr(tc + LVTS_MONCTL2, 1u << 16 | 0x001); /* filter and sensor interval 1 period */
+		wr(tc + LVTS_MSRCTL0, 0x492);           /* 2 of 4 samples */
+		IODelay(1);
+	}
+	for (uint32_t c = 0; c < 3; c++) {
+		vm_offset_t tc = lvts + 0x100 * c;
+
+		wr(tc + LVTS_MONCTL0, points[c]);
+		printf("lvts init 4: controller %u: MONCTL0 %08x, MONCTL1 %08x, MONCTL2 %08x, MSRCTL0 %08x, MONINT %08x\n", c,
+		    *(volatile uint32_t *)(tc + LVTS_MONCTL0), *(volatile uint32_t *)(tc + LVTS_MONCTL1),
+		    *(volatile uint32_t *)(tc + LVTS_MONCTL2), *(volatile uint32_t *)(tc + LVTS_MSRCTL0),
+		    *(volatile uint32_t *)(tc + LVTS_MONINT));
+	}
+}
+
 void
 hakios_mt6781_lvts_init(void)
 {
@@ -277,6 +319,9 @@ hakios_mt6781_lvts_init(void)
 			}
 			if (step >= 3) {
 				init_step3();
+			}
+			if (step >= 4) {
+				init_step4();
 			}
 		}
 	}
