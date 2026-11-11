@@ -24,6 +24,11 @@
  * the proof (a TEST UNIT READY that must come back in this list after the switch), slot 1 the reads, the others a
  * TEST UNIT READY that is never rung. Data goes through one contiguous bounce buffer, cleaned and invalidated around
  * every read. The doorbell is rung and waited for with interrupts off.
+ *
+ * Writing (boot-arg mtkufs_write=1, and mtkloader's mtkufs_dlba= mtkufs_dblocks=, checked against the GPT here like
+ * xnusys's): WRITE(10) and READ(10) only inside the partition darwin past its first MiB (T26's), SYNCHRONIZE CACHE(10)
+ * of all of it; nothing else ever written. mtkufs_wtest=1 is the dry run: one MiB of a known pattern at darwin + 1 MiB,
+ * written, the cache synchronized, read back and compared, with the speed of each.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -82,7 +87,7 @@ void hakios_mt6781_ufs_quiesce(void);
 #define UTRD_CT_UFS         (1u << 28)
 #define UTRD_DD_MASK        (3u << 25)
 #define UTRD_DD_NONE        (0u << 25)
-#define UTRD_DD_OUT         (1u << 25)          /* host to device: never */
+#define UTRD_DD_OUT         (1u << 25)          /* host to device: WRITE(10) into darwin's window only */
 #define UTRD_DD_IN          (2u << 25)
 #define OCS_SUCCESS         0x0
 #define OCS_INVALID         0xf
@@ -107,6 +112,7 @@ void hakios_mt6781_ufs_quiesce(void);
 #define GPT_HEADER          1                   /* the primary GPT, as gpt-carve.py lays it for 4096-byte blocks */
 #define GPT_ENTRIES         2
 #define GPT_ENTRY_BLOCKS    4                   /* 128 entries of 128 bytes */
+#define DARWIN_KEEP         256                 /* darwin's first MiB: T26's configuration, never written here */
 
 struct mufs_cmd {
 	uint8_t upiu[32];
@@ -119,6 +125,9 @@ static vm_offset_t mufs_ucd;                    /* the command descriptors, not 
 static uint64_t mufs_area_pa, mufs_bounce_pa;
 static uint8_t *mufs_bounce;                    /* cached; cleaned and invalidated around every read */
 static uint64_t part_lba, part_blocks, lk_utrl; /* from mtkloader */
+static uint64_t dlba, dblocks;                  /* darwin, from mtkloader; used only with mtkufs_write=1 and the GPT's word */
+static bool write_on, darwin_ok;                /* mtkufs_write=1; darwin checked against the GPT */
+static uint64_t mufs_writes;
 static uint64_t dev_blocks;                     /* what the device says it is: xnusys's APFS containers, else all of it */
 static bool apfs_found;
 static uint32_t cnr_in;
@@ -183,16 +192,18 @@ mufs_refusal(const uint8_t *upiu, uint32_t dw0)
 	const uint8_t *cdb = upiu + 16;
 	uint32_t dd = dw0 & UTRD_DD_MASK, expected = be32(upiu + 12);
 
+	bool writing = write_on && darwin_ok && cdb[0] == 0x2a;
+
 	if ((dw0 & UTRD_CT_MASK) != UTRD_CT_UFS) {
 		return "not a UFS storage command type";
 	}
-	if (dd == UTRD_DD_OUT || dd == UTRD_DD_MASK) {
+	if (dd == UTRD_DD_MASK || (dd == UTRD_DD_OUT && !writing)) {
 		return "data from host to device";
 	}
 	if ((upiu[0] & 0x3f) != UPIU_COMMAND) {
 		return "not a SCSI command (a query, task management, NOP, ...)";
 	}
-	if (upiu[1] & UPIU_FLAG_WRITE) {
+	if ((upiu[1] & UPIU_FLAG_WRITE) && !writing) {
 		return "the W flag";
 	}
 	if (upiu[4] & 0x0f) {
@@ -214,11 +225,41 @@ mufs_refusal(const uint8_t *upiu, uint32_t dw0)
 		if (gpt_window && lba >= GPT_HEADER && lba + n <= GPT_ENTRIES + GPT_ENTRY_BLOCKS) {
 			return NULL;
 		}
+		if (write_on && darwin_ok && lba >= dlba + DARWIN_KEEP && lba - dlba < dblocks && n <= dblocks - (lba - dlba)) {
+			return NULL;                    /* darwin's window */
+		}
 		if (lba < part_lba || lba - part_lba >= part_blocks || n > part_blocks - (lba - part_lba)) {
 			return "a read outside xnusys";
 		}
 		return NULL;
 	}
+	case 0x2a: {    /* WRITE(10): inside darwin past its first MiB, with mtkufs_write=1 only */
+		uint64_t lba = be32(cdb + 2), n = (uint64_t)cdb[7] << 8 | cdb[8];
+
+		if (!writing) {
+			return "a write (mtkufs_write=1 and a checked darwin needed)";
+		}
+		if (dd != UTRD_DD_OUT || (upiu[1] & (UPIU_FLAG_READ | UPIU_FLAG_WRITE)) != UPIU_FLAG_WRITE) {
+			return "a write without data to the device";
+		}
+		if (cdb[1] != 0 || cdb[6] != 0 || cdb[9] != 0) {
+			return "a write with flags, group or control set";
+		}
+		if (n == 0 || expected != n * BLOCK) {
+			return "a write whose length is not what the UPIU expects";
+		}
+		if (lba < dlba + DARWIN_KEEP || lba - dlba >= dblocks || n > dblocks - (lba - dlba)) {
+			return "a write outside darwin's window";
+		}
+		return NULL;
+	}
+	case 0x35:      /* SYNCHRONIZE CACHE(10): all of the cache, with mtkufs_write=1 only */
+		if (!write_on || !darwin_ok) {
+			return "SYNCHRONIZE CACHE(10) without mtkufs_write=1";
+		}
+		return dd == UTRD_DD_NONE && expected == 0 && (upiu[1] & (UPIU_FLAG_READ | UPIU_FLAG_WRITE)) == 0 &&
+		       cdb[1] == 0 && be32(cdb + 2) == 0 && cdb[7] == 0 && cdb[8] == 0 ? NULL :
+		       "SYNCHRONIZE CACHE(10) other than of the whole cache, without data";
 	case 0x25:      /* READ CAPACITY(10) */
 		return dd == UTRD_DD_IN && (upiu[1] & UPIU_FLAG_READ) && expected == 8 ? NULL :
 		       "READ CAPACITY(10) other than 8 bytes from the device";
@@ -292,6 +333,26 @@ make_capacity(struct mufs_cmd *c)
 	c->dw0 = UTRD_CT_UFS | UTRD_DD_IN;
 }
 
+static void
+make_write(struct mufs_cmd *c, uint32_t lba, uint32_t blocks)
+{
+	make_read(c, lba, blocks);
+	c->upiu[1] = UPIU_FLAG_WRITE;
+	c->upiu[16] = 0x2a;
+	c->dw0 = UTRD_CT_UFS | UTRD_DD_OUT;
+}
+
+static void
+make_sync(struct mufs_cmd *c)
+{
+	bzero(c, sizeof(*c));
+	c->upiu[0] = UPIU_COMMAND;
+	c->upiu[2] = MUFS_LUN;
+	c->upiu[3] = SLOT_READ;
+	c->upiu[16] = 0x35;
+	c->dw0 = UTRD_CT_UFS | UTRD_DD_NONE;
+}
+
 /* The whitelist tried on commands made up here and never sent. Pure bytes; nothing touches the controller. */
 static bool
 mufs_selftest(void)
@@ -362,6 +423,74 @@ mufs_selftest(void)
 	printf("mtkufs: whitelist tried on %u commands made up and never sent (reads in and around xnusys, other units, "
 	    "W flag, data out, WRITE, READ(16), UNMAP, INQUIRY, REQUEST SENSE, SYNC, START STOP, query, NOP): %s\n",
 	    (unsigned)(sizeof(cases) / sizeof(cases[0])) + 2, right ? "as it should" : "WRONG");
+	return right;
+}
+
+/* With darwin open for writing: the same, for the writes and their window (darwin and xnusys as they are now). */
+static bool
+mufs_selftest_darwin(void)
+{
+	static const struct {
+		uint8_t op, flags;
+		int where;              /* 0 darwin + 1 MiB, 1 darwin's last block, 2 darwin's first, 3 the block before
+		                         * darwin + 1 MiB, 4 darwin's end (past it), 5 xnusys's first, 6 block 1 (GPT) */
+		uint32_t blocks, dd;
+		uint8_t cdb1;
+		bool pass;
+		const char *what;
+	} cases[] = {
+		{ 0x2a, UPIU_FLAG_WRITE, 0, 1, UTRD_DD_OUT, 0, true, "WRITE(10) of darwin + 1 MiB" },
+		{ 0x2a, UPIU_FLAG_WRITE, 0, 64, UTRD_DD_OUT, 0, true, "WRITE(10) of 64 blocks there" },
+		{ 0x2a, UPIU_FLAG_WRITE, 1, 1, UTRD_DD_OUT, 0, true, "WRITE(10) of darwin's last block" },
+		{ 0x2a, UPIU_FLAG_WRITE, 1, 2, UTRD_DD_OUT, 0, false, "WRITE(10) across darwin's end" },
+		{ 0x2a, UPIU_FLAG_WRITE, 4, 1, UTRD_DD_OUT, 0, false, "WRITE(10) past darwin" },
+		{ 0x2a, UPIU_FLAG_WRITE, 2, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of darwin's first block (T26's MiB)" },
+		{ 0x2a, UPIU_FLAG_WRITE, 3, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of the last block of T26's MiB" },
+		{ 0x2a, UPIU_FLAG_WRITE, 3, 2, UTRD_DD_OUT, 0, false, "WRITE(10) across into T26's MiB" },
+		{ 0x2a, UPIU_FLAG_WRITE, 5, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of xnusys" },
+		{ 0x2a, UPIU_FLAG_WRITE, 6, 1, UTRD_DD_OUT, 0, false, "WRITE(10) of the GPT" },
+		{ 0x2a, UPIU_FLAG_READ, 0, 1, UTRD_DD_OUT, 0, false, "WRITE(10) with the R flag" },
+		{ 0x2a, UPIU_FLAG_WRITE, 0, 1, UTRD_DD_IN, 0, false, "WRITE(10) with data from the device" },
+		{ 0x2a, UPIU_FLAG_WRITE, 0, 1, UTRD_DD_OUT, 0x08, false, "WRITE(10) with FUA" },
+		{ 0x28, UPIU_FLAG_READ, 0, 1, UTRD_DD_IN, 0, true, "READ(10) of darwin + 1 MiB" },
+		{ 0x28, UPIU_FLAG_READ, 2, 1, UTRD_DD_IN, 0, false, "READ(10) of T26's MiB" },
+		{ 0x28, UPIU_FLAG_READ | UPIU_FLAG_WRITE, 0, 1, UTRD_DD_IN, 0, false, "READ(10) of darwin with the W flag" },
+		{ 0x28, UPIU_FLAG_READ, 0, 1, UTRD_DD_OUT, 0, false, "READ(10) of darwin with data to the device" },
+		{ 0x8a, UPIU_FLAG_WRITE, 0, 1, UTRD_DD_OUT, 0, false, "WRITE(16)" },
+		{ 0x2e, UPIU_FLAG_WRITE, 0, 1, UTRD_DD_OUT, 0, false, "WRITE AND VERIFY(10)" },
+		{ 0x42, UPIU_FLAG_WRITE, 0, 1, UTRD_DD_OUT, 0, false, "UNMAP" },
+	};
+	struct mufs_cmd c;
+	bool right = true;
+
+	for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		uint64_t lba = cases[i].where == 0 ? dlba + DARWIN_KEEP : cases[i].where == 1 ? dlba + dblocks - 1 :
+		    cases[i].where == 2 ? dlba : cases[i].where == 3 ? dlba + DARWIN_KEEP - 1 :
+		    cases[i].where == 4 ? dlba + dblocks : cases[i].where == 5 ? part_lba : GPT_HEADER;
+		bool passed;
+
+		make_write(&c, (uint32_t)lba, cases[i].blocks);
+		c.upiu[1] = cases[i].flags;
+		c.upiu[16] = cases[i].op;
+		c.upiu[17] = cases[i].cdb1;
+		c.dw0 = UTRD_CT_UFS | cases[i].dd;
+		passed = mufs_refusal(c.upiu, c.dw0) == NULL;
+		if (passed != cases[i].pass) {
+			printf("mtkufs: the whitelist %s %s\n", passed ? "LETS THROUGH" : "refuses", cases[i].what);
+			right = false;
+		}
+	}
+	make_sync(&c);
+	right &= mufs_refusal(c.upiu, c.dw0) == NULL;
+	c.upiu[17] = 0x02;                      /* IMMED */
+	right &= mufs_refusal(c.upiu, c.dw0) != NULL;
+	make_sync(&c);
+	c.upiu[21] = 1;                         /* a range of blocks */
+	right &= mufs_refusal(c.upiu, c.dw0) != NULL;
+	printf("mtkufs: whitelist for darwin tried on %u commands made up and never sent (writes in, at the edges of and "
+	    "outside its window, T26's MiB, xnusys, the GPT, wrong flags and directions, FUA, WRITE(16), WRITE AND VERIFY, "
+	    "UNMAP, SYNCHRONIZE CACHE whole, IMMED and ranged): %s\n", (unsigned)(sizeof(cases) / sizeof(cases[0])) + 3,
+	    right ? "as it should" : "WRONG");
 	return right;
 }
 
@@ -595,6 +724,40 @@ read_abs(uint64_t lba, uint32_t blocks, const char *what)
 	return error;
 }
 
+/* blocks [lba, lba + blocks) of LUN 2 from src, through the bounce buffer (mufs_lock held; the whitelist keeps it in
+ * darwin's window) */
+static int
+write_abs(uint64_t lba, uint32_t blocks, const uint8_t *src, const char *what)
+{
+	struct mufs_cmd c;
+	int error;
+
+	memcpy(mufs_bounce, src, (size_t)blocks * BLOCK);
+	/* out of the cache to memory, where the controller reads it */
+	FlushPoC_DcacheRegion((vm_offset_t)mufs_bounce, (size_t)blocks * BLOCK);
+	make_write(&c, (uint32_t)lba, blocks);
+	error = mufs_place(SLOT_READ, &c, blocks * BLOCK);
+	if (error == 0) {
+		error = mufs_ring(SLOT_READ, what);
+	}
+	if (error == 0) {
+		mufs_writes++;
+	}
+	return error;
+}
+
+/* the device's write cache out to the flash (mufs_lock held) */
+static int
+mufs_sync(void)
+{
+	struct mufs_cmd c;
+	int error;
+
+	make_sync(&c);
+	error = mufs_place(SLOT_READ, &c, 0);
+	return error != 0 ? error : mufs_ring(SLOT_READ, "SYNCHRONIZE CACHE(10)");
+}
+
 /* bytes [offset, offset + len) of xnusys into dst, through the bounce buffer, a slot's worth at a time */
 static int
 mufs_read(uint64_t offset, uint8_t *dst, uint64_t len)
@@ -651,10 +814,10 @@ static bool
 mufs_gpt_check(void)
 {
 	static uint8_t hdr[BLOCK];
-	static const char name[] = "xnusys";
+	static const char name[] = "xnusys", dname[] = "darwin";
 	const uint8_t *ent = mufs_bounce;
 	const char *no = NULL;
-	uint64_t entries = 0, first = 0, last = 0;
+	uint64_t entries = 0, first = 0, last = 0, dfirst = 0, dlast = 0;
 	uint32_t hsize = 0, hcrc, count = 0, esize = 0, ecrc;
 	int e;
 
@@ -699,13 +862,41 @@ mufs_gpt_check(void)
 			if (name[k] == 0 && x[56 + 2 * k] == 0 && x[57 + 2 * k] == 0) {
 				first = le(x + 32, 8);
 				last = le(x + 40, 8);
-				break;
+			}
+			for (k = 0; dname[k] && x[56 + 2 * k] == (uint8_t)dname[k] && x[57 + 2 * k] == 0; k++) {
+			}
+			if (dname[k] == 0 && x[56 + 2 * k] == 0 && x[57 + 2 * k] == 0) {
+				dfirst = le(x + 32, 8);
+				dlast = le(x + 40, 8);
 			}
 		}
 		if (no == NULL && (first == 0 || last < first)) {
 			no = "no xnusys in the GPT";
 		} else if (no == NULL && (first != part_lba || last - first + 1 != part_blocks)) {
 			no = "xnusys in the GPT is not where mtkloader said";
+		}
+		/* darwin: only with mtkufs_write=1, where mtkloader said, clear of xnusys and of the GPT, a window past its MiB */
+		if (no == NULL && write_on) {
+			const char *dno = NULL;
+
+			if (dlba == 0 || dblocks == 0) {
+				dno = "mtkloader gave no darwin";
+			} else if (dfirst == 0 || dlast < dfirst) {
+				dno = "no darwin in the GPT";
+			} else if (dfirst != dlba || dlast - dfirst + 1 != dblocks) {
+				dno = "darwin in the GPT is not where mtkloader said";
+			} else if (!(dlast < first || dfirst > last) || dfirst <= GPT_ENTRIES + GPT_ENTRY_BLOCKS ||
+			    dblocks <= DARWIN_KEEP || dlast > 0xffffffffULL) {
+				dno = "darwin overlaps xnusys or the GPT, or is no bigger than its first MiB";
+			}
+			if (dno != NULL) {
+				printf("mtkufs: darwin NOT opened for writing: %s (GPT: darwin %llu..%llu; mtkloader: %llu+%llu)\n", dno,
+				    dfirst, dlast, dlba, dblocks);
+			} else {
+				darwin_ok = true;
+				printf("mtkufs: GPT check: darwin %llu..%llu, as mtkloader said: open for writing past its first MiB "
+				    "(mtkufs_write=1)\n", dfirst, dlast);
+			}
 		}
 	}
 	lck_mtx_unlock(&mufs_lock);
@@ -716,6 +907,77 @@ mufs_gpt_check(void)
 	}
 	printf("mtkufs: GPT check: header and entries CRCs good, xnusys %llu..%llu, as mtkloader said\n", first, last);
 	return true;
+}
+
+/*
+ * mtkufs_wtest=1, the dry run of writing: darwin blocks 256..511 (its second MiB) -- what they held (crc32), then a
+ * pattern written eight times over, the cache synchronized, read back eight times and compared. Word i of darwin block
+ * b holds b * 1024 + i (little-endian), so a dd of that MiB from Android can be checked against the same rule.
+ */
+static void
+mufs_write_test(void)
+{
+	enum { BLOCKS = 256, ROUNDS = 8, CHUNK = BOUNCE / BLOCK };
+	static uint32_t pattern[BLOCKS * BLOCK / 4];
+	uint32_t crc_before = 0, crc_after = 0, bad = 0, bad_block = 0;
+	uint64_t t, write_us = 0, sync_us = 0, read_us = 0, bytes = (uint64_t)ROUNDS * BLOCKS * BLOCK;
+	int error = 0;
+
+	for (uint32_t i = 0; i < BLOCKS * BLOCK / 4; i++) {
+		pattern[i] = (DARWIN_KEEP + i / (BLOCK / 4)) * (BLOCK / 4) + i % (BLOCK / 4);
+	}
+	lck_mtx_lock(&mufs_lock);
+	for (uint32_t b = 0; error == 0 && b < BLOCKS; b += CHUNK) {
+		error = read_abs(dlba + DARWIN_KEEP + b, CHUNK, "darwin's second MiB, before");
+		crc_before = crc32(crc_before, mufs_bounce, CHUNK * BLOCK);
+	}
+	t = mach_absolute_time();
+	for (uint32_t r = 0; error == 0 && r < ROUNDS; r++) {
+		for (uint32_t b = 0; error == 0 && b < BLOCKS; b += CHUNK) {
+			error = write_abs(dlba + DARWIN_KEEP + b, CHUNK, (const uint8_t *)pattern + (size_t)b * BLOCK,
+			    "darwin's second MiB, the pattern");
+		}
+	}
+	write_us = us_since(t);
+	t = mach_absolute_time();
+	if (error == 0) {
+		error = mufs_sync();
+	}
+	sync_us = us_since(t);
+	t = mach_absolute_time();
+	for (uint32_t r = 0; error == 0 && r < ROUNDS; r++) {
+		crc_after = 0;
+		for (uint32_t b = 0; error == 0 && b < BLOCKS; b += CHUNK) {
+			error = read_abs(dlba + DARWIN_KEEP + b, CHUNK, "darwin's second MiB, read back");
+			crc_after = crc32(crc_after, mufs_bounce, CHUNK * BLOCK);
+			for (uint32_t k = 0; error == 0 && k < CHUNK; k++) {
+				if (memcmp(mufs_bounce + (size_t)k * BLOCK, (const uint8_t *)pattern + (size_t)(b + k) * BLOCK, BLOCK) != 0) {
+					if (bad++ == 0) {
+						bad_block = DARWIN_KEEP + b + k;
+					}
+				}
+			}
+		}
+	}
+	read_us = us_since(t);
+	lck_mtx_unlock(&mufs_lock);
+	write_us += write_us == 0;
+	read_us += read_us == 0;
+	if (error != 0) {
+		printf("mtkufs: write test STOPPED (%d): %llu writes done; see the line before\n", error, mufs_writes);
+		return;
+	}
+	printf("mtkufs: write test: darwin blocks %u..%u (LUN 2 blocks %llu..%llu): crc32 before %08x; the pattern (crc32 "
+	    "%08x) written %u times in %llu ms (%llu.%llu MB/s, %u requests of %u KiB), cache synchronized in %llu ms, read "
+	    "back %u times in %llu ms (%llu.%llu MB/s): %s%s (crc32 %08x)\n", DARWIN_KEEP, DARWIN_KEEP + BLOCKS - 1,
+	    dlba + DARWIN_KEEP, dlba + DARWIN_KEEP + BLOCKS - 1, crc_before, crc32(0, pattern, sizeof(pattern)), ROUNDS,
+	    write_us / 1000, bytes / write_us, (bytes * 10 / write_us) % 10, ROUNDS * BLOCKS / CHUNK, CHUNK * BLOCK / 1024,
+	    sync_us / 1000, ROUNDS, read_us / 1000, bytes / read_us, (bytes * 10 / read_us) % 10,
+	    bad == 0 ? "the same every time" : "DIFFERENT", bad == 0 ? "" : " (blocks wrong, the first darwin block given)",
+	    crc_after);
+	if (bad != 0) {
+		printf("mtkufs: write test: %u blocks read back wrong, the first darwin block %u\n", bad, bad_block);
+	}
 }
 
 /* not used after all: LK's list back now, and nothing more sent */
@@ -776,6 +1038,12 @@ mufs_start(void)
 		return ENXIO;
 	}
 	printf("mtkufs: xnusys at LUN 2 block %llu, %llu blocks of 4096 (from mtkloader)\n", part_lba, part_blocks);
+	on = 0;
+	write_on = PE_parse_boot_argn("mtkufs_write", &on, sizeof(on)) && on != 0;
+	if (write_on && (!PE_parse_boot_argn("mtkufs_dlba", &dlba, sizeof(dlba)) ||
+	    !PE_parse_boot_argn("mtkufs_dblocks", &dblocks, sizeof(dblocks)))) {
+		dlba = dblocks = 0;
+	}
 	if (!mufs_selftest()) {
 		return ENXIO;
 	}
@@ -838,6 +1106,14 @@ mufs_start(void)
 		return mufs_give_up();
 	}
 	usable = true;
+	if (darwin_ok && (dlba + dblocks - 1 > lastlba || !mufs_selftest_darwin())) {
+		darwin_ok = false;
+		printf("mtkufs: darwin closed again: past the unit's end, or the whitelist for it wrong\n");
+	}
+	on = 0;
+	if (darwin_ok && PE_parse_boot_argn("mtkufs_wtest", &on, sizeof(on)) && on != 0) {
+		mufs_write_test();
+	}
 
 	/* the device as long as xnusys's APFS containers, back to back, as the Hot 20's eMMC driver has it (md0's size) */
 	dev_blocks = part_blocks;
@@ -1040,13 +1316,13 @@ hakios_mt6781_ufs_quiesce(void)
 
 	if (!in) {
 		if (started && usable) {
-			say_late("mtkufs: at the end: LK's list already in; %llu reads, %llu errors, %llu refused\n", mufs_reads,
-			    mufs_errors, mufs_refused);
+			say_late("mtkufs: at the end: LK's list already in; %llu reads, %llu writes, %llu errors, %llu refused\n",
+			    mufs_reads, mufs_writes, mufs_errors, mufs_refused);
 		}
 		return;
 	}
 	ok = mufs_put_back(&left, &cnr);
 	say_late("mtkufs: at the end: transfer list %s LK's %llx (doorbell on entry %08x, completion bits of this kernel's "
-	    "cleared %08x); %llu reads, %llu errors, %llu refused\n", ok ? "back to" : "NOT BACK TO", lk_utrl, left, cnr,
-	    mufs_reads, mufs_errors, mufs_refused);
+	    "cleared %08x); %llu reads, %llu writes, %llu errors, %llu refused\n", ok ? "back to" : "NOT BACK TO", lk_utrl,
+	    left, cnr, mufs_reads, mufs_writes, mufs_errors, mufs_refused);
 }

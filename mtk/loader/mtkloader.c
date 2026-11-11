@@ -4578,17 +4578,37 @@ static char *cl_dec(char *at, uint64_t v)
 	return at;
 }
 
+/* a partition's first and last block among the GPT's entries in ufs_data, or 0, 0 */
+static void ufs_gpt_find(const char *name, uint32_t count, uint32_t size, uint64_t *first, uint64_t *last)
+{
+	const volatile uint8_t *d = ufs_data;
+
+	*first = *last = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const volatile uint8_t *e = d + i * size;
+		uint32_t k;
+
+		for (k = 0; name[k] && e[56 + 2 * k] == (uint8_t)name[k] && e[57 + 2 * k] == 0; k++) {
+		}
+		if (name[k] == 0 && e[56 + 2 * k] == 0 && e[57 + 2 * k] == 0) {
+			*first = ufs_le(e + 32, 8);
+			*last = ufs_le(e + 40, 8);
+			return;
+		}
+	}
+}
+
 /*
  * xnusys, found in the user unit's GPT (header at LBA 1, its entries after), for the kernel's UFS driver
  * (mtk/mt6781/drivers/storage/hakios.mt6781_ufs.c): " mtkufs_lba=<first block> mtkufs_blocks=<count>
  * mtkufs_lkutrl=<LK's list>" onto the command line. When anything is not as expected nothing is added, and the
- * driver then leaves the controller alone.
+ * driver then leaves the controller alone. darwin as well, if it is there and clear of xnusys: " mtkufs_dlba=
+ * mtkufs_dblocks=" (the driver opens it only with mtkufs_write=1, and checks it against the GPT itself).
  */
 static void xnu_ufs_args(char *cl)
 {
-	static const char name[] = "xnusys";
 	const volatile uint8_t *d = ufs_data;
-	uint64_t utrl = ufs_lk_list(), alt, entries, first = 0, last = 0;
+	uint64_t utrl = ufs_lk_list(), alt, entries, first = 0, last = 0, dfirst = 0, dlast = 0;
 	uint32_t count, size;
 	char *at = cl;
 
@@ -4605,26 +4625,20 @@ static void xnu_ufs_args(char *cl)
 		out("xnu ufs: the GPT's entries not read; no mtkufs_ arguments\n");
 		return;
 	}
-	for (uint32_t i = 0; i < count; i++) {
-		const volatile uint8_t *e = d + i * size;
-		uint32_t k;
-
-		for (k = 0; name[k] && e[56 + 2 * k] == (uint8_t)name[k] && e[57 + 2 * k] == 0; k++) {
-		}
-		if (name[k] == 0 && e[56 + 2 * k] == 0 && e[57 + 2 * k] == 0) {
-			first = ufs_le(e + 32, 8);
-			last = ufs_le(e + 40, 8);
-			break;
-		}
-	}
+	ufs_gpt_find("xnusys", count, size, &first, &last);
+	ufs_gpt_find("darwin", count, size, &dfirst, &dlast);
 	if (first < entries + 4 || last < first || last >= alt || last > 0xffffffffULL) {
 		out("xnu ufs: no usable xnusys in the GPT; no mtkufs_ arguments\n");
 		return;
 	}
+	if (dfirst < entries + 4 || dlast < dfirst || dlast >= alt || dlast > 0xffffffffULL ||
+	    !(dlast < first || dfirst > last)) {
+		dfirst = dlast = 0;                     /* not there, or not clear of xnusys: not given */
+	}
 	while (*at) {
 		at++;
 	}
-	if ((uint32_t)(at - cl) + 80 >= BOOT_LINE_LENGTH) {
+	if ((uint32_t)(at - cl) + 130 >= BOOT_LINE_LENGTH) {
 		out("xnu ufs: no room on the command line; no mtkufs_ arguments\n");
 		return;
 	}
@@ -4633,12 +4647,28 @@ static void xnu_ufs_args(char *cl)
 	at = cl_put(at, " mtkufs_blocks=");
 	at = cl_dec(at, last - first + 1);
 	at = cl_put(at, " mtkufs_lkutrl=");
-	cl_dec(at, utrl);
+	at = cl_dec(at, utrl);
+	if (dlast != 0) {
+		at = cl_put(at, " mtkufs_dlba=");
+		at = cl_dec(at, dfirst);
+		at = cl_put(at, " mtkufs_dblocks=");
+		cl_dec(at, dlast - dfirst + 1);
+	}
 	out("xnu ufs: xnusys at LBA ");
 	out_dec(first);
 	out(", ");
 	out_dec(last - first + 1);
-	out(" blocks; LK's list ");
+	out(" blocks; darwin ");
+	if (dlast != 0) {
+		out("at LBA ");
+		out_dec(dfirst);
+		out(", ");
+		out_dec(dlast - dfirst + 1);
+		out(" blocks");
+	} else {
+		out("not found");
+	}
+	out("; LK's list ");
 	out_hex(utrl);
 	out("\n");
 }
