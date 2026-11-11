@@ -1,0 +1,8 @@
+# Commands run by the launchd job com.hakios.demo to see what SpringBoard waits for during the boot (RC_JOBS=rc.jobs.t37):
+# Darwin's ps -A at about 35, 55 and 70 s from power-on (the job list starts at about 18 s).
+sleep 17
+/bin/ps -A
+sleep 19
+/bin/ps -A
+sleep 14
+/bin/ps -A
